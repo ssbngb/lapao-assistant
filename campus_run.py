@@ -100,7 +100,8 @@ class StateWatcher(threading.Thread):
 class CampusRunner:
     def __init__(self, client, pace_min_km: float, target_km: float, cp_needed: int,
                  log=lambda s: print(s, flush=True), watcher: bool = True, source: str = "screen",
-                 auto_start: bool = False, auto_finish: bool = False):
+                 auto_start: bool = False, auto_finish: bool = False,
+                 start_lat: float | None = None, start_lon: float | None = None):
         self.c = client
         self.log = log
         self.target_pace_s = max(PACE_MIN_S + 30, min(PACE_MAX_S - 30, pace_min_km * 60.0))
@@ -114,8 +115,10 @@ class CampusRunner:
         self.auto_finish = auto_finish
         self.reader = ScreenReader() if source == "screen" else None
 
-        # 默认校园田径场起点 (示例经纬度，可按需修改为自己学校操场坐标)
-        self.default_start = (31.638994, 118.896724)
+        # 默认校园田径场起点 (支持参数传入或环境变量，默认提供示例坐标)
+        def_lat = start_lat if start_lat is not None else float(os.environ.get("LEPAO_START_LAT", "31.638994"))
+        def_lon = start_lon if start_lon is not None else float(os.environ.get("LEPAO_START_LON", "118.896724"))
+        self.default_start = (def_lat, def_lon)
         already_in_run = False
         if source == "screen":
             try:
@@ -612,6 +615,8 @@ def main():
     ap.add_argument("--cps", type=int, default=2, help="需要完成的打卡点数（默认 2）")
     ap.add_argument("--auto-start", action="store_true", help="若在首页则自动点击开始乐跑")
     ap.add_argument("--auto-finish", action="store_true", help="达标后自动长按结束并保存")
+    ap.add_argument("--start-lat", type=float, default=None, help="起始点纬度（WGS-84，默认读环境变量 LEPAO_START_LAT 或内置示例）")
+    ap.add_argument("--start-lon", type=float, default=None, help="起始点经度（WGS-84，默认读环境变量 LEPAO_START_LON 或内置示例）")
     args = ap.parse_args()
 
     _lock_fh = _acquire_run_lock()
@@ -652,7 +657,8 @@ def main():
     client = MuMuLocationClient(vm_index=0, manager_path=MANAGER)
     client.ensure_gps_enabled()
     runner = CampusRunner(client, args.pace, args.km, args.cps,
-                          auto_start=args.auto_start, auto_finish=args.auto_finish)
+                          auto_start=args.auto_start, auto_finish=args.auto_finish,
+                          start_lat=args.start_lat, start_lon=args.start_lon)
     try:
         runner.run()
     except KeyboardInterrupt:
