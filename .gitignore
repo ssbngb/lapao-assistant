@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+.workbuddy/
+.zcode/
+
+# Large binaries & External tools
+*.apk
+lepao_base.apk
+Reqable/
+*.exe
+*.dll
+
+# Third-party cloned repositories (keep local, not tracked)
+assistant/
+budaolepao/
+run-helper/
+yunyundong/
+
+# Sensitive dumps & student credentials (NEVER COMMIT)
+mmkv_dump/
+setting_now*
+mumu_logged.xml
+*.lock
+
+# Android screenshots, cropped metrics, and UI XML dumps
+*.png
+*.jpg
+*.jpeg
+*.xml
+
+# Allow project documentation assets
+!assets/*.png
+!assets/*.jpg
+
+# Runtime Logs
+*.log
+morning_run_*.log
+afternoon_run_*.log
+
+# Databases & local configs
+*.db
+*.sqlite3
+*.osm
+campus.osm
+.env
+config.json
+yunyundong_config.json
