@@ -7,6 +7,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![OCR](https://img.shields.io/badge/Vision%20Engine-RapidOCR%20(ONNX)-FF6F00?style=for-the-badge&logo=onnx&logoColor=white)](https://github.com/RapidAI/RapidOCR)
 [![Emulator](https://img.shields.io/badge/Emulator-MuMu%20Player%2012-00B4D8?style=for-the-badge)](https://mumu.163.com/)
+[![Community](https://img.shields.io/badge/Community-LINUX%20DO-24292e?style=for-the-badge&logo=linux&logoColor=white)](https://linux.do)
 [![GitHub stars](https://img.shields.io/github/stars/wmuj/budao-lepao?style=for-the-badge&color=gold)](https://github.com/wmuj/budao-lepao/stargazers)
 
 <br/>
@@ -225,6 +226,12 @@ python campus_run_sim.py
 2. 自动建立 ADB 本地通道并激活 GPS 定位模式；
 3. 自动进入步道乐跑、自动起跑、双打卡点寻路打卡、配速闭环调控、自动结算退出；
 4. 运行结果可重定向至日志文件（`morning_run_latest.log`），全流程零弹窗干扰。
+
+---
+
+## 🤝 鸣谢与社区认可
+
+本项目由 **[LINUX DO 社区](https://linux.do/)** 提供交流与开源推广支持，认可并践行「真诚、友善、团结、专业」的开源极客精神！
 
 ---
 
