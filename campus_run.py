@@ -101,7 +101,8 @@ class CampusRunner:
     def __init__(self, client, pace_min_km: float, target_km: float, cp_needed: int,
                  log=lambda s: print(s, flush=True), watcher: bool = True, source: str = "screen",
                  auto_start: bool = False, auto_finish: bool = False,
-                 start_lat: float | None = None, start_lon: float | None = None):
+                 start_lat: float | None = None, start_lon: float | None = None,
+                 adb_serial: str | None = None):
         self.c = client
         self.log = log
         self.target_pace_s = max(PACE_MIN_S + 30, min(PACE_MAX_S - 30, pace_min_km * 60.0))
@@ -113,7 +114,10 @@ class CampusRunner:
         self.source = source
         self.auto_start = auto_start
         self.auto_finish = auto_finish
-        self.reader = ScreenReader() if source == "screen" else None
+        self.reader = ScreenReader(
+            adb_path=getattr(client, "adb_path", None),
+            serial=adb_serial,
+        ) if source == "screen" else None
 
         # 默认校园田径场起点 (支持参数传入或环境变量，默认提供示例坐标)
         def_lat = start_lat if start_lat is not None else float(os.environ.get("LEPAO_START_LAT", "31.638994"))
@@ -608,6 +612,26 @@ def _acquire_run_lock():
     return fh
 
 
+def _parse_vm_info(raw: str, vm_index: int) -> dict:
+    """兼容 MuMuManager.exe info 返回的单对象、字典映射或列表结构。"""
+    data = json.loads(raw)
+    if isinstance(data, list):
+        for item in data:
+            if str(item.get("index")) == str(vm_index):
+                return item
+        return data[0] if data else {}
+    if isinstance(data, dict) and "index" not in data:
+        return data.get(str(vm_index), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _android_major_version(ver_str: str) -> int | None:
+    try:
+        return int(str(ver_str).strip().split(".")[0])
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="校园定向打卡 + 配速闭环")
     ap.add_argument("--pace", type=float, default=6.0, help="目标平均配速，分钟/公里（默认 6.0）")
@@ -617,48 +641,74 @@ def main():
     ap.add_argument("--auto-finish", action="store_true", help="达标后自动长按结束并保存")
     ap.add_argument("--start-lat", type=float, default=None, help="起始点纬度（WGS-84，默认读环境变量 LEPAO_START_LAT 或内置示例）")
     ap.add_argument("--start-lon", type=float, default=None, help="起始点经度（WGS-84，默认读环境变量 LEPAO_START_LON 或内置示例）")
+    ap.add_argument("--vm-index", type=int, default=None, help="MuMu 模拟器多开实例编号（默认读环境变量 MUMU_VM_INDEX，未设置则为 0）")
     args = ap.parse_args()
 
     _lock_fh = _acquire_run_lock()
 
-    # 1. 确保模拟器已启动
-    adb_port = 16384
-    try:
-        chk = subprocess.run([MANAGER, "info", "-v", "0"], capture_output=True, text=True, timeout=15)
-        info = json.loads(chk.stdout)
-        adb_port = info.get("adb_port") or 16384
-        if not info.get("is_android_started"):
-            print("正在唤醒 MuMu 模拟器 Android 12…", flush=True)
-            subprocess.run([MANAGER, "control", "-v", "0", "launch"], capture_output=True, timeout=15)
-            for _ in range(45):
-                time.sleep(2)
-                chk = subprocess.run([MANAGER, "info", "-v", "0"], capture_output=True, text=True, timeout=15)
-                info = json.loads(chk.stdout)
-                if info.get("is_android_started"):
-                    adb_port = info.get("adb_port") or adb_port
-                    break
-            time.sleep(3)
-    except Exception:
-        pass
+    vm_index = args.vm_index if args.vm_index is not None else int(os.environ.get("MUMU_VM_INDEX", "0"))
+    os.environ["MUMU_VM_INDEX"] = str(vm_index)
+
+    disc = discover_mumu()
+    manager = disc.get("manager") or (MANAGER if os.path.exists(MANAGER) else None)
+
+    # 1. 检测实例版本并确保模拟器已启动
+    adb_host = "127.0.0.1"
+    adb_port = 16384 + vm_index * 32
+    if manager:
+        try:
+            chk = subprocess.run([manager, "info", "-v", str(vm_index)], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=15)
+            info = _parse_vm_info(chk.stdout, vm_index)
+            android_ver = str(info.get("android_version") or "").strip()
+            major = _android_major_version(android_ver)
+            if major is not None and major >= 15:
+                print(
+                    f"[警告] 当前 MuMu 实例 #{vm_index} 的系统版本为 Android {android_ver}。\n"
+                    f"       官方版步道乐跑在 Android 15 上因加固壳 ART ABI 变更极易闪退！\n"
+                    f"       强烈建议在 MuMu 多开器中新建 Android 12 实例（关闭 ROOT），并通过 --vm-index <编号> 指定该实例。",
+                    flush=True,
+                )
+            adb_host = info.get("adb_host_ip") or adb_host
+            adb_port = info.get("adb_port") or adb_port
+            if not info.get("is_android_started"):
+                ver_label = f"Android {android_ver}" if android_ver else "Android"
+                print(f"正在唤醒 MuMu 模拟器实例 #{vm_index} ({ver_label})…", flush=True)
+                subprocess.run([manager, "control", "-v", str(vm_index), "launch"], capture_output=True, timeout=15)
+                for _ in range(45):
+                    time.sleep(2)
+                    chk = subprocess.run([manager, "info", "-v", str(vm_index)], capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace", timeout=15)
+                    info = _parse_vm_info(chk.stdout, vm_index)
+                    if info.get("is_android_started"):
+                        adb_host = info.get("adb_host_ip") or adb_host
+                        adb_port = info.get("adb_port") or adb_port
+                        break
+                time.sleep(3)
+        except Exception as exc:
+            print(f"[提示] 查询或唤醒 MuMu 实例 #{vm_index} 异常：{exc}", flush=True)
 
     # 2. 确保 ADB 已连接且系统启动完成
-    disc = discover_mumu()
     adb_bin = disc.get("adb")
-    serial = f"127.0.0.1:{adb_port}"
+    serial = f"{adb_host}:{adb_port}"
     if adb_bin:
-        for _ in range(15):
-            subprocess.run([adb_bin, "connect", serial], capture_output=True, timeout=10)
-            boot = subprocess.run([adb_bin, "-s", serial, "shell", "getprop", "sys.boot_completed"],
-                                  capture_output=True, text=True, timeout=10)
-            if boot.stdout.strip() == "1":
-                break
+        for _ in range(30):
+            try:
+                subprocess.run([adb_bin, "connect", serial], capture_output=True, timeout=15)
+                boot = subprocess.run([adb_bin, "-s", serial, "shell", "getprop", "sys.boot_completed"],
+                                      capture_output=True, text=True, timeout=15)
+                if boot.stdout.strip() == "1":
+                    break
+            except (subprocess.TimeoutExpired, Exception):
+                pass
             time.sleep(2)
 
-    client = MuMuLocationClient(vm_index=0, manager_path=MANAGER)
+    client = MuMuLocationClient(vm_index=vm_index, manager_path=manager)
     client.ensure_gps_enabled()
     runner = CampusRunner(client, args.pace, args.km, args.cps,
                           auto_start=args.auto_start, auto_finish=args.auto_finish,
-                          start_lat=args.start_lat, start_lon=args.start_lon)
+                          start_lat=args.start_lat, start_lon=args.start_lon,
+                          adb_serial=serial)
     try:
         runner.run()
     except KeyboardInterrupt:
