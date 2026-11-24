@@ -49,7 +49,7 @@ class StepFeeder(threading.Thread):
         self.cadence = max(MIN_CADENCE, min(MAX_CADENCE, int(cadence)))
         self.log = logger
         self.start_delay = start_delay
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._paused = threading.Event()
         self.steps = 0
         self.failures = 0
@@ -59,7 +59,7 @@ class StepFeeder(threading.Thread):
                 self.log("警告：检测到多个步数发生器实例，已限流（不要同时开两个本程序）")
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def pause(self):
         """临时暂停脉冲（例如用户要看模拟器画面时）。"""
@@ -81,11 +81,11 @@ class StepFeeder(threading.Thread):
 
     def run(self):
         if self.start_delay > 0:
-            self._stop.wait(self.start_delay)
+            self._stop_event.wait(self.start_delay)
         next_at = time.time()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self._paused.is_set():
-                self._stop.wait(0.1)
+                self._stop_event.wait(0.1)
                 next_at = time.time()
                 continue
             try:
@@ -99,7 +99,7 @@ class StepFeeder(threading.Thread):
             next_at += iv
             sleep_s = next_at - time.time()
             if sleep_s > 0:
-                time.sleep(sleep_s)
+                self._stop_event.wait(sleep_s)
             elif sleep_s < -0.35:
                 # 落后太多说明被别的东西挤了，重新对齐，避免追帧式连发
                 next_at = time.time()

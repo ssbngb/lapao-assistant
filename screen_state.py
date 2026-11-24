@@ -44,10 +44,11 @@ def _ocr():
 
 
 class ScreenReader:
-    def __init__(self, adb_path: str | None = None, serial: str | None = None):
-        disc = discover_mumu()
-        self.adb = adb_path or disc.get("adb")
+    def __init__(self, adb_path: str | None = None, serial: str | None = None, *,
+                 reconnect=True):
+        self.adb = adb_path or discover_mumu().get("adb")
         self.serial = serial or "127.0.0.1:16384"
+        self.reconnect = reconnect
         self._last_dist_m = 0.0
         self._last_elapsed_s = 0
         if not self.adb:
@@ -57,7 +58,7 @@ class ScreenReader:
         out = subprocess.run([self.adb, "-s", self.serial, "exec-out", "screencap", "-p"],
                              capture_output=True, timeout=20,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if not out.stdout:
+        if not out.stdout and self.reconnect:
             # 自动尝试重连 ADB
             subprocess.run([self.adb, "connect", self.serial],
                            capture_output=True, timeout=10,
@@ -74,7 +75,7 @@ class ScreenReader:
             res, _ = _ocr()(img.crop(box))
         return [t for _, t, _ in (res or [])]
 
-    def stats(self, img=None):
+    def stats(self, img=None, *, fresh_only=False):
         img = img or self.shot()
         texts = self._ocr_crop(img, CROP_STATS)
         distance_m = elapsed_s = None
@@ -85,6 +86,8 @@ class ScreenReader:
             elif elapsed_s is None and re.fullmatch(r"\d{2}:\d{2}:\d{2}", s):
                 h, m, sec = s.split(":")
                 elapsed_s = int(h) * 3600 + int(m) * 60 + int(sec)
+        if fresh_only:
+            return distance_m, elapsed_s
         if distance_m is not None:
             self._last_dist_m = max(self._last_dist_m, distance_m)
         if elapsed_s is not None:
@@ -137,11 +140,11 @@ def read_once(reader: ScreenReader):
     return dist, elapsed, name, cp_dist, pending
 
 
-def read_screen_state(reader: ScreenReader):
+def read_screen_state(reader: ScreenReader, *, fresh_only=False):
     """一次截图读出 (里程, 用时, 打卡点)。读不到关键数字时返回 None。"""
     img = reader.shot()
-    dist, elapsed = reader.stats(img)
-    if dist == 0.0 and elapsed == 0:
+    dist, elapsed = reader.stats(img, fresh_only=fresh_only) if fresh_only else reader.stats(img)
+    if dist is None or elapsed is None or (dist == 0.0 and elapsed == 0):
         return None
     name, cp_dist, pending, punched = reader.point_info(img)
     return RunState(dist, elapsed, punched, "", name, cp_dist, pending, "")

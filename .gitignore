@@ -4,6 +4,11 @@ __pycache__/
 *$py.class
 *.pytest_cache/
 
+# Virtual environment
+.venv/
+venv/
+env/
+
 # OS / Editor files
 .DS_Store
 Thumbs.db
@@ -11,48 +16,46 @@ Thumbs.db
 *.swo
 .vscode/
 .idea/
-.workbuddy/
-.zcode/
 
-# Large binaries & External tools
+# Runtime artifacts
+*.lock
+*.log
+app_error.log
+campus_run.lock
+run_now.log
+run_now.err
+
+# Map tile cache (regenerated at runtime)
+_tiles/
+_tile_test/
+
+# Local config & routes (machine-specific, contains personal coordinates)
+run_config.json
+route.json
+config.json
+.env
+
+# Android artifacts & personal data (NEVER COMMIT)
 *.apk
 lepao_base.apk
-Reqable/
-*.exe
-*.dll
+mmkv_dump/
+setting_now*
+mumu_logged.xml
+*.db
+*.sqlite3
 
-# Third-party cloned repositories (keep local, not tracked)
+# Third-party cloned repos (keep local)
 assistant/
 budaolepao/
 run-helper/
 yunyundong/
 
-# Sensitive dumps & student credentials (NEVER COMMIT)
-mmkv_dump/
-setting_now*
-mumu_logged.xml
-*.lock
-
-# Android screenshots, cropped metrics, and UI XML dumps
+# Screenshots / temp images (all ignored by default)
 *.png
 *.jpg
 *.jpeg
 *.xml
 
-# Allow project documentation assets
+# ...except documentation assets
 !assets/*.png
 !assets/*.jpg
-
-# Runtime Logs
-*.log
-morning_run_*.log
-afternoon_run_*.log
-
-# Databases & local configs
-*.db
-*.sqlite3
-*.osm
-campus.osm
-.env
-config.json
-yunyundong_config.json

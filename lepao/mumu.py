@@ -339,6 +339,11 @@ class MuMuGateway:
             raise RuntimeError("所选模拟器尚未启动或未提供 ADB 端口，请启动该实例")
         self._adb_serial = "%s:%s" % (data.get("adb_host_ip", "127.0.0.1"), data["adb_port"])
 
+    def adb_serial(self, *, refresh=False):
+        if refresh or not getattr(self, "_adb_serial", None):
+            self._resolve_adb_serial()
+        return self._adb_serial
+
     def _adb(self, *args):
         return subprocess.run([self.adb_path, *args], capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=15,

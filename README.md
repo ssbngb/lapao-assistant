@@ -1,272 +1,473 @@
-<div align="center">
+# 步道乐跑 一体化控制台
 
-# 🏃‍♂️ 步道乐跑校园定向跑全自动闭环智能体
-### `budao-lepao` · Autonomous Closed-Loop Campus Running Agent
-
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
-[![OCR](https://img.shields.io/badge/Vision%20Engine-RapidOCR%20(ONNX)-FF6F00?style=for-the-badge&logo=onnx&logoColor=white)](https://github.com/RapidAI/RapidOCR)
-[![Emulator](https://img.shields.io/badge/Emulator-MuMu%20Player%2012-00B4D8?style=for-the-badge)](https://mumu.163.com/)
-[![Community](https://img.shields.io/badge/Community-LINUX%20DO-24292e?style=for-the-badge&logo=linux&logoColor=white)](https://linux.do)
-[![GitHub stars](https://img.shields.io/github/stars/wmuj/budao-lepao?style=for-the-badge&color=gold)](https://github.com/wmuj/budao-lepao/stargazers)
-
-<br/>
-
-**⚡️ 告别黑产抓包逆向 · 基于计算机视觉闭环与空间数值梯度的物理级全自主校园跑步机器人 ⚡️**
-
-[💡 项目初衷](#-项目初衷) •
-[📸 运行效果](#-实机运行效果) •
-[🧠 核心算法原理](#-核心算法与技术创新) •
-[🏗️ 系统架构](#-系统工程架构) •
-[🚀 快速上手](#-快速上手) •
-[❓ 常见问题](#-常见问题-faq) •
-[⚖️ 免责声明](#-免责声明-disclaimer)
-
-</div>
+> 面向 MuMu 模拟器的步道乐跑辅助工具：**地图选点画路线 + 手动摇杆 + 全自动寻路** 三合一。
+>
+> 基于 [wmuj/budao-lepao](https://github.com/wmuj/budao-lepao) 重构，主要解决了原版**只服务单一学校、无法自定义路线、缺少 GUI** 三个问题。
 
 ---
 
-## 💡 项目初衷
+## 先看几张图
 
-> **"早晨 6:30 的闹钟响了，但我只想在晚上酣畅淋漓地夜跑。"**
+| ① 摇杆手动 | ② 地图选点画路线 |
+|---|---|
+| ![摇杆页](assets/gui_joystick.png) | ![路线页](assets/gui_route.png) |
 
-许多高校对大学生实施了强制性的**清晨晨跑打卡制度**（通常限定在清晨 06:30 ~ 07:30 时段），一旦缺卡将直接影响学期体育成绩甚至奖学金评定。然而，当代大学生的作息规律、课业安排各不相同，大量同学**更倾向于在下午或晚间课余时间自主锻炼**，却常常受困于严苛死板的清晨打卡规则。
+| ③ 全自动寻路 | ④ 工具与配置 |
+|---|---|
+| ![自动页](assets/gui_auto.png) | ![工具页](assets/gui_tools.png) |
 
-本项目专门**为了解决“早起实在起不来、但课余愿意自主跑步”的同学们的晨跑痛点**而研发。  
-我们**不采用任何修改内存、Hook、逆向封包或破解加密算法的高危黑产手段**，而是基于 Android 虚拟化底座、计算机视觉 OCR 状态识别与自适应空间数值梯度算法，在宿主机侧构建了一套完全仿真人类真实操作与运动规律的合规闭环系统。
-
----
-
-## 📸 实机运行效果
-
-<div align="center">
-  <table style="margin: 0 auto; border-collapse: collapse; text-align: center;">
-    <thead>
-      <tr style="background-color: #f6f8fa;">
-        <th align="center" width="33%"><b>📍 跑步中实时监控与智能打卡</b></th>
-        <th align="center" width="33%"><b>⏱️ 闭环配速控制与指标结算</b></th>
-        <th align="center" width="33%"><b>🗺️ 最终达标轨迹与状态</b></th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td align="center"><img src="assets/running_progress.png" width="280" alt="跑步中状态"/></td>
-        <td align="center"><img src="assets/run_result_metrics.png" width="280" alt="配速结算指标"/></td>
-        <td align="center"><img src="assets/run_track_map.png" width="280" alt="完成轨迹"/></td>
-      </tr>
-      <tr>
-        <td align="center"><sub>实时 RapidOCR 异步获取打卡点距离<br/>自适应正交负梯度自动逼近</sub></td>
-        <td align="center"><sub>严格锁死 <code>5'59" ~ 6'00"/km</code> 黄金配速<br/>步频动态注入，完全消除异常波动</sub></td>
-        <td align="center"><sub>打卡点数达标 (2/2) + 里程达标 (2.05km)<br/>自动长按滑动结算，成绩即时入库</sub></td>
-      </tr>
-    </tbody>
-  </table>
-</div>
+> 截图中的坐标是占位示例，与任何具体学校无关。首次使用请在「② 路线」页搜索自己的学校，或直接在地图上点起点。
 
 ---
 
-## 🥊 方案对比：为什么这是终极解决方案？
+## 前置：脱壳版步道乐跑
 
-| 维度 | 传统抓包 / 逆向协议挂 (已淘汰) | 传统 UI 脚本 / 模拟器死循环 (极不稳定) | 🌟 本项目 (`budao-lepao`) |
-| :--- | :--- | :--- | :--- |
-| **底层机理** | 逆向 API、伪造加密签名 (SM4/AES/HMAC) | 裸 `adb shell input` + `uiautomator dump` | **视觉 OCR 离线闭环 + 空间数值梯度寻优** |
-| **风控安全性** | ❌ **极度危险**。服务端接口随时迭代风控 | ⚠️ **高危**。无动态步频，轨迹生硬易被判作弊 | 🛡️ **极高**。物理传感器摇一摇脉冲 + 真机级自然航向 |
-| **打卡点适应性**| ⚠️ 依赖打卡点数据库；未录入则彻底失效 | ❌ **无法应对随机点**，只能跑固定路线 | 🎯 **全自适应**。无需提前预录坐标，梯度实时逼近 |
-| **系统稳定性** | ❌ 证书绑定与网络环境变化即瘫痪 | ❌ 跑步页计时器刷新引发 dump `rc=137` 崩溃 | ⚡️ **毫秒级高可用**。独立异步线程 OCR，零崩溃 |
-| **配速达标率** | ⚠️ 固定算法，打卡停留易导致均速超标 | ❌ 无动态调速能力，极易超出合格区间 | 🎯 **100% 达标**。闭环控速锁死 6'00"，超时自动补齐 |
+原版 App 带加固（爱加密），在模拟器里会 `SIGSEGV in libdexfile.so` 直接闪退，**必须换脱壳版**：
+
+**<https://github.com/guiheng123/budaolepao>**
+
+装好脱壳版（本项目实测 4.3.3）再往下走。为什么必须脱壳、以及装完还要做什么，见 [关键的坑](#关键的坑二次开发必读) 第一节。
 
 ---
 
-## 🧠 核心算法与技术创新
+## 目录
 
-### 1. 2D 正交数值梯度动态寻路算法 (Orthogonal Gradient Descent)
-步道乐跑的核心机制是**“每跑满一定距离后由服务端动态分配下一个随机打卡点”**，App 界面仅显示目标点名称及模糊的“距你 $d$ 米”，不暴露经纬度。
-
-本项目通过在二维地理平面进行微步正交探测（Orthogonal Probing）：
-$$\frac{\partial d}{\partial x} \approx \frac{d(x + \Delta x, y) - d(x, y)}{\Delta x}, \quad \frac{\partial d}{\partial y} \approx \frac{d(x, y + \Delta y) - d(x, y)}{\Delta y}$$
-
-构造空间距离梯度向量：
-$$\nabla d(x, y) = \begin{pmatrix} \frac{\partial d}{\partial x} \\ \frac{\partial d}{\partial y} \end{pmatrix}$$
-
-运动控制引擎直接沿**负梯度方向**推进：
-$$\vec{v} = - v_{\text{run}} \cdot \frac{\nabla d}{\|\nabla d\|_2}$$
-
-当距离衰减至目标点阈值（$\le 20\text{m}$）时，系统自动切入原地微动巡航状态，等待 App 触发打卡成功提示后，无缝切入下一个随机打卡点。
-
-### 2. RapidOCR 离线视觉异步状态机
-* **痛点突破**：跑步中界面的计时器每秒刷新，Android 原生 `uiautomator dump` 会因等待 Accessibility 空闲而超时被系统 SIGKILL（`rc=137`）。
-* **解决方案**：绕过 UIAutomator，采用 `adb exec-out screencap -p` 直接读取帧缓冲区（Framebuffer），交由本地轻量化 **ONNXRuntime + RapidOCR** 推理引擎，在 150ms 内完成局部仪表盘（里程、用时、打卡点）高精文本抽取，为控制循环提供稳定的感知反馈。
-
-### 3. 动态时间补偿与配速闭环控制器
-为保证最终平均配速严格落在高校要求的合格区间（$3'00" \sim 8'00"/\text{km}$，黄金均速 $6'00"/\text{km}$）：
-* **停留补偿机制**：每次在打卡点停留等待打卡会损失约 10~15 秒时间；
-* **闭环动态调速**：
-  $$v_{\text{target}}(t) = \text{clamp}\left(\frac{D_{\text{total}} - D(t)}{T_{\text{target}} - T(t)}, \, 2.30\text{ m/s}, \, 4.40\text{ m/s}\right)$$
-  打卡完成后系统自动平滑加速追回损失时间，里程达标时配速完美收敛于 $6'00"/\text{km}$。
-
-### 4. 真实物理加速度计脉冲注入
-* App 内部通过传感器事件监听（SensorEventListener）检测加速度峰谷判定步数与防作弊运动状态；
-* 系统通过 MuMu 内核网关以符合真实步频（175~185 spm）的频率定时发送 `shake` 脉冲，使虚拟传感器产生 $9.8 \to 40 \to 30 \to 9.8\text{ m/s}^2$ 的生理级峰谷，确保步数、步频与里程在高校后台完全拟合。
+- [先看几张图](#先看几张图)
+- [前置：脱壳版步道乐跑](#前置脱壳版步道乐跑)
+- [它解决什么问题](#它解决什么问题)
+- [核心特性](#核心特性)
+- [快速开始](#快速开始)
+- [四个页签怎么用](#四个页签怎么用)
+- [技术原理](#技术原理)
+- [目录结构](#目录结构)
+- [关键的坑（二次开发必读）](#关键的坑二次开发必读)
+- [已知限制](#已知限制)
+- [免责声明](#免责声明)
 
 ---
 
-## 🏗️ 系统工程架构
+## 它解决什么问题
 
-```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                        CampusRunner 主决策中枢                          │
-└───────┬────────────────────────────────────────────────────────┬───────┘
-        │ 状态轮询 (0.5s)                                        │ 坐标/传感器控制 (1.0s)
-        ▼                                                        ▼
-┌───────────────────────────────┐        ┌───────────────────────────────┐
-│     StateWatcher 观测线程      │        │     MuMuLocationClient 底座   │
-├───────────────────────────────┤        ├───────────────────────────────┤
-│ • exec-out screencap 截图     │        │ • WGS-84 / GCJ-02 / BD-09 矩阵 │
-│ • RapidOCR (ONNX) 局部文字识别 │        │ • HTTP 网关虚拟定位下发        │
-│ • RunState 状态标准化解析     │        │ • StepFeeder 真实步频模拟      │
-└───────────────────────────────┘        └───────────────────────────────┘
-        │                                                        │
-        └───────────────────────┬────────────────────────────────┘
-                                ▼
-        ┌────────────────────────────────────────────────┐
-        │      网易 MuMu 模拟器 (Android 12 / 1080x1920) │
-        │      步道乐跑 官方客户端 (无注入 / 无篡改)      │
-        └────────────────────────────────────────────────┘
+步道乐跑的校园跑有里程门槛、配速区间、打卡点等要求。在模拟器里跑，会碰到四个硬骨头：
+
+| 问题 | 现象 | 本项目怎么做 |
+|---|---|---|
+| **定位注入** | 模拟器 GPS 是假的，怎么让它按路线走 | 走 MuMu 本地网关 HTTP 接口，逐段下发 WGS-84 坐标 |
+| **反作弊** | 轨迹是直线 / 一步跳几十米 → 立即终止 | 增量推进（每步 ≤2.5 m）+ 转向抖动 + 禁止瞬移 |
+| **步数** | 只推定位，App 记 0 步 | 按步频向网关发 `shake` 脉冲（84 spm） |
+| **通用性** | 原版把作者学校的坐标写死在代码里 | 地图选点 + 路线绘制，配置外置到 JSON |
+
+原版的核心算法（梯度寻路、配速闭环、OCR 状态机）保留并修复，外围补齐了 GUI 和可配置能力。
+
+---
+
+## 核心特性
+
+### ① 摇杆手动控制
+
+人眼直接看模拟器地图判断方向，脚本只负责按方向推进定位 —— 完全绕开「App 距离读数滞后」这个死结。
+
+- 圆形摇杆拖拽 / `WASD` / 方向键 / `QEZC` 斜向 / 八方向快捷按钮
+- 速度 1.0~6.0 m/s，实时显示对应配速
+- 空格急停，松开方向键、离开摇杆页或窗口失焦时停止手动移动
+
+### ② 地图选点 + 路线绘制
+
+- **地名搜索**：内置 OSM Nominatim，输入学校名或地名直接跳转（返回 WGS-84，无需转换）
+- **坐标跳转**：直接填经纬度
+- **点击画线**：地图上点起点 → 连续点拐角 → 自动算全程距离
+- **路线持久化**：存成 `route.json`，下次一键加载
+- **沿路线跑**：按设定速度在线段上插值推进，每步 ≤2.5 m
+
+支持 **z=3~18** 瓦片层级（z=3 可见全国，z=18 可见单栋楼）。
+
+### ③ 全自动寻路
+
+调用 `campus_run.py`：OCR 读屏 → 探测打卡点方位 → 梯度导航 → 配速闭环 → 自动结算。
+
+> ⚠️ **当前不稳定**。自动寻路依赖 App 屏幕上「距打卡点 N 米」的数值，实测该数值刷新严重滞后（走 20 米后仍返回旧值），导致方向判断失准。**推荐优先使用摇杆或路线模式。**
+
+### ④ 工具
+
+环境自检（查询连接、应用信息并读取截图）、轨迹预演（离线生成轨迹图）、配置管理。
+
+---
+
+## 快速开始
+
+### 环境要求
+
+| 项 | 版本 |
+|---|---|
+| Windows | 10 / 11 |
+| Python | 3.10+（开发环境 3.12.16） |
+| MuMu 模拟器 | 12，Android 12，实例 #0 |
+| 步道乐跑 | **脱壳重打包版**（官方版有加固壳，在模拟器里会 SIGSEGV） |
+
+### 安装
+
+```bat
+cd budao-lepao
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
+依赖：`rapidocr_onnxruntime`（离线 OCR）、`onnxruntime`、`Pillow`、`numpy`、`opencv-python`。地图瓦片下载与 GUI 只用标准库。
+
+### 运行
+
+```bat
+控制台.bat
+```
+
+或
+
+```bat
+.venv\Scripts\python.exe app.py
+```
+
+> `控制台.bat` 用 `pythonw.exe` 启动（不弹黑窗）。注意 `pythonw` 下 `sys.stdout` 为 `None`，代码里已做保护。
+
+### 前置检查
+
+启动前确认：
+
+1. MuMu 已启动，实例 #0 已进入 Android 桌面
+2. 步道乐跑已登录，并进入**跑步页**（能看到「长按暂停」）
+3. MuMu 设置里 **ADB 调试已开启**
+
+在 ④ 工具页签点「环境自检」查看连接和读屏状态。自检只查询，不会改动模拟器位置或传感器。若 ADB 尚未连接，可点控制台左下角状态栏重连。
+
 ---
 
-## 📂 仓库目录规范
+## 四个页签怎么用
+
+### ① 摇杆
+
+![摇杆页](assets/gui_joystick.png)
+
+```
+实时状态  1.24 km  07:27  配速 06'04"  已打卡 1
+          打卡点：体育馆门口   距 327 米
+
+方向摇杆          快捷方向
+   ↑北            西北 正北 东北
+ 西●东            正西      正东
+   ↓南            西南 正南 东南
+
+速度  1.0 ──●── 6.0    约 5'57"/km
+      ■ 立即停下   复位到起点
+```
+
+看模拟器地图判断打卡点方位 → 推摇杆 → 顶部距离数字在减小说明走对了 → 距离接近 0 时停下等自动打卡。
+
+### ② 路线
+
+![路线页](assets/gui_route.png)
+
+```
+搜索地点 [你的学校名______] [搜索]   或坐标 [39.904200],[116.407400] [跳转]
+[ 找到 2 个结果，选一个跳转                                  ▼ ]
+┌─────────────────────────────────┬─────────────────┐
+│                                 │ 点击模式         │
+│           地  图                │  ○ 选起点        │
+│                                 │  ○ 画路线        │
+│                                 │ 当前：起点/点数/全程│
+│                                 │ 速度 / 操作       │
+└─────────────────────────────────┴─────────────────┘
+```
+
+**首次配置流程**：搜索学校 → 跳转 → 「选起点」点操场起跑位置 → 「画路线」依次点跑道拐角（两个直道端点 + 两个弯道顶点）→ 保存 → 之后直接「加载路线」+「沿路线跑」。
+
+### ③ 全自动
+
+![自动页](assets/gui_auto.png)
+
+填里程/配速/打卡数 → 点「全自动开跑」。参数通过命令行传给 `campus_run.py`。
+
+> 全自动依赖 App 的「距打卡点」读数，而该读数刷新很慢（走 20 米后仍返回旧值），所以寻路可能不准。**优先用摇杆页**。
+
+### ④ 工具
+
+![工具页](assets/gui_tools.png)
+
+环境自检 / 轨迹预演 / 编辑起始坐标、定位下发间隔和读屏间隔。保存位置后，摇杆页的「复位到起点」会使用新坐标。
+
+---
+
+## 技术原理
+
+### 定位注入
+
+MuMu 提供本地 HTTP 网关（默认 `127.0.0.1:24576`）：
+
+```http
+POST /player/window
+{"id": "<uuid>", "action": "location", "params": {"lat": .., "lon": ..}}
+```
+
+**注意坐标系**：定位层接收 **WGS-84**，内部转 BD-09 后下发（MuMu 按 BD-09 解释，再做 BD09→GCJ02→WGS84）。
+
+支持的 action 实测清单：
+
+| action | 结果 |
+|---|---|
+| `location` | ✅ 定位下发 |
+| `tool_click` (`type: shake`) | ✅ 但只摇窗口，**不产生传感器数据** |
+| `gravity` (`x/y/z`) | ✅ 接口成功，但**不改变加速度计读数** |
+| `sensor` / `set_gravity` / `gyro` / `input` | ❌ `API_ACTION_NOT_SUPPORTED` |
+
+### 反作弊规避
+
+三条硬约束，每条都是实测撞出来的：
+
+```python
+STEP_MAX_M = 8.0            # 单段导航位移上限
+step_size  = 2.5            # 巡航每步位移
+# 巡航：从当前位置增量推进，绝不直接 set 绝对坐标
+mv_n = dn - cur_n
+mv_e = de - cur_e
+```
+
+| 违规行为 | 后果 |
+|---|---|
+| 一步跳 60 米 | 立即终止「跑步行为异常」 |
+| 每步直接 set 绝对目标坐标 | 里程跳跃式增长，配速瞬间失真（实测 6 秒记 50 米 → 配速 2'00"）|
+| 探测后瞬移回原点 | 立即终止（20 米瞬移） |
+
+**轨迹自然化**：航向每秒抖 ±4°、速度抖 ±5%、位置抖 ±0.4 m —— 避免出现完美几何这种机器特征。
+
+### 步频脉冲
+
+```python
+class StepFeeder(threading.Thread):
+    MIN_SHAKE_INTERVAL_S = 0.70   # 单次 shake 处理耗时约 655ms
+    MAX_CADENCE = 84              # 等效 84 spm
+```
+
+移动时 `resume()` 发包，停下 `pause()`。**不发 shake 步数就是 0** —— 这是摇杆模式最初漏掉的部分。
+
+> 步数换算有非线性：实测 84 shake/min 在 App 侧记成约 126 步/min。
+
+### 地图实现
+
+自研，无地图库依赖。核心是 Web Mercator 瓦片金字塔：
+
+```python
+def lonlat_to_tile(lat, lon, z):
+    n = 2 ** z
+    x = (lon + 180.0) / 360.0 * n
+    lr = math.radians(lat)
+    y = (1.0 - math.log(math.tan(lr) + 1/math.cos(lr)) / math.pi) / 2.0 * n
+    return x, y       # 浮点：整数部分是瓦片号，小数部分是瓦片内偏移
+```
+
+- **瓦片源**：高德 `webrd0{1-4}.is.autonavi.com/appmaptile`，**z=3~18**（z≥19 无数据）
+- **三级缓存**：有上限的内存图片缓存 → 磁盘 `_tiles/{z}/{x}/{y}.png` → 网络
+- **坐标差异**：瓦片是 **GCJ-02**，定位层是 **WGS-84**，进出地图都要转换（`lepao/geo.py` 已有完整实现，往返误差 0.000 m）
+- **防白屏**：缺瓦片时用父层级裁剪放大 2 倍垫底
+- **增量渲染**：固定数量的后台线程下载瓦片，完成后刷新，失败的瓦片会稍后重试
+
+### 坐标系
+
+```python
+wgs84_to_gcj02()   gcj02_to_wgs84()      # 火星坐标（高德/腾讯）
+gcj02_to_bd09()    bd09_to_gcj02()       # 百度坐标
+wgs84_to_bd09()    bd09_to_wgs84()       # MuMu 网关要 BD-09
+haversine()        meters_per_degree()   # 距离与米/度换算
+offset_meters()                          # 按米偏移经纬度
+```
+
+**在中国境内 GCJ-02 与 WGS-84 相差 300~700 米**，混用会导致地图偏移半个校区。
+
+### OCR 读屏
+
+`exec-out screencap` 截图为 PNG，快速裁切关键区域后送 RapidOCR（ONNX 离线推理），解析出里程/用时/配速/打卡点数/打卡点名称与距离。
+
+---
+
+## 目录结构
 
 ```
 budao-lepao/
-├── README.md                 # 本项目完整技术文档与免责声明
-├── LICENSE                   # MIT 开源许可证
-├── requirements.txt          # Python 依赖清单
-├── .gitignore                # 严密防泄露配置 (隔离全部个人凭据与大文件)
-├── campus_run.py             # 核心生产主控：正交梯度寻优 + 配速闭环 + 异常容错
-├── screen_state.py           # 机器视觉模块：RapidOCR 离线局部截屏解析器
-├── campus_state.py           # 状态模型：RunState 实体类与数据解析
-├── campus_run_sim.py         # 仿真平台：内置虚拟时钟的极速离线仿真器
-├── start_campus_run.bat      # Windows 一键执行入口
-├── run_afternoon_once.bat    # 定时调度/自动化任务执行脚本
-├── start_assistant.py        # 辅助调试启动工具
-├── assets/                   # 项目说明配图 (完全脱敏)
-│   ├── running_progress.png  # 寻路中截屏
-│   ├── run_result_metrics.png# 配速结算图
-│   └── run_track_map.png     # 轨迹成果图
-├── lepao/                    # 底层虚拟化通信与传感器驱动引擎
-│   ├── __init__.py
-│   ├── geo.py                # 大地测量学坐标转换 (WGS-84/GCJ-02/BD-09) 与测距
-│   ├── mumu.py               # MuMu 本地网关通信、ADB 指令与窗口状态管理
-│   ├── sensors.py            # 加速度计脉冲发生器与步频自适应调节
-│   ├── routes.py             # 操场跑道环线拟合模型
-│   ├── track.py              # 运动轨迹建模与序列化
-│   └── autolink.py           # 路径连通性检测
-└── tools/                    # 历史单点测试与调试工具集
-    ├── punch_gate.py         # 目标点定点测试
-    ├── punch_cp2.py          # 打卡点直通测试
-    ├── run_trigger_cp2.py    # 触发距离步进测试
-    ├── run_to_checkpoint.py  # 寻路回归测试
-    ├── run_300m_test.py      # 短程闭环测试
-    └── run_freerun_2km.py    # 操场自由跑测试
+├── 控制台.bat              启动入口（纯 ASCII，调 pythonw）
+├── app.py                  一体化 GUI（四页签 + 共享定位引擎 + 自研地图）
+│
+├── campus_run.py           全自动主控：OCR 状态机 + 三边定位 + 配速闭环
+├── campus_run_sim.py       离线仿真器（无需模拟器即可回归算法）
+├── campus_state.py         RunState 数据模型
+├── screen_state.py         RapidOCR 截屏解析
+├── auto_start.py           自动过弹窗引导（OCR 按文字点按钮）
+├── check_env.py            只读环境自检
+├── check_track.py          轨迹预演（离线出图 + 形状判定）
+│
+├── run_config.json         运行配置（起点坐标/里程/间隔，可被 GUI 改写）
+│
+├── lepao/                  底层引擎
+│   ├── mumu.py             MuMu 网关通信、ADB 指令、坐标系补偿
+│   ├── geo.py              坐标转换与大地测量
+│   ├── sensors.py          步频脉冲发生器
+│   ├── routes.py           跑道环带几何（StadiumBand，可选）
+│   ├── track.py            轨迹建模与序列化
+│   ├── autolink.py         路径连通性检测
+│   ├── location_guard.py   定位合法性校验
+│   ├── startup_location.py 启动时定位
+│   └── sim.py              仿真用的虚拟时钟与假网关
+│
+├── tools/                  历史单点测试脚本
+│   ├── punch_gate.py       定点打卡测试
+│   ├── punch_cp2.py        第二打卡点直通
+│   ├── run_300m_test.py    短程闭环
+│   ├── run_to_checkpoint.py 寻路回归
+│   ├── run_trigger_cp2.py  触发距离步进
+│   └── run_freerun_2km.py  自由跑 2km
+│
+├── 试跑调参记录.md         完整调参笔记与踩坑记录
+├── requirements.txt
+├── LICENSE
+└── README.md
 ```
 
 ---
 
-## 🚀 快速上手
+## 关键的坑（二次开发必读）
 
-### 1. 环境准备
-1. **操作系统**：Windows 10 / 11 64位
-2. **Python 环境**：Python 3.10 ~ 3.12
-3. **Android 模拟器**：安装 [网易 MuMu 模拟器 12](https://mumu.163.com/)
-   * **重要（防闪退必看）**：新版 MuMu 官网包默认创建的可能是 **Android 15** 实例，会导致官方版步道乐跑启动即闪退！请务必在 **「MuMu 多开器」** 中明确新建并选用 **Android 12** 实例
-   * 模拟器设置中**关闭 ROOT 权限**
-   * 模拟器分辨率建议配置为手机竖屏：`1080 x 1920` (DPI 480)
-   * 模拟器系统设置中开启定位服务（高精度模式）
-   * 模拟器内安装并登录官方版步道乐跑 App
+这些都是实际撞出来的，改代码前先看一遍能省大量时间。
 
-### 2. 安装项目依赖
-克隆本项目到本地后，在命令行执行：
-```bash
-git clone https://github.com/wmuj/budao-lepao.git
-cd budao-lepao
-pip install -r requirements.txt
+### 陷阱 0：原版 App 在模拟器里必闪退
+
+官方包的 `libdexfile.so` 被加固（爱加密），MuMu 的 houdini 转译不了，启动即 `SIGSEGV`。
+
+**必须装脱壳版**：<https://github.com/guiheng123/budaolepao>（本项目实测 4.3.3）
+
+装完还要注意两点：
+
+- 别用 `am start -n com.lptiyu.tanke/...MainActivity` 启动 —— 该 Activity 未导出，会抛 `SecurityException`。改用
+  `monkey -p com.lptiyu.tanke -c android.intent.category.LAUNCHER 1`
+- 脱壳版首次启动后要手动登录一次；之后别在 App 里连按返回键，会退回 `BeforeLoginActivity` 掉登录
+
+### 陷阱 1：探测距离不能太小
+
+```python
+# ❌ 走 4 米只需 1.5 秒，App 的「距打卡点」还没刷新，读到旧值
+PROBE_M = 4.0
+# ✅ 走 20 米约 8 秒，App 有时间刷新
+PROBE_M = 20.0
 ```
 
-### 3. 一键运行正式跑步
-确保 MuMu 模拟器已开启并在前台/后台运行，步道乐跑处于首页，在项目根目录下双击运行：
-```bat
-start_campus_run.bat
+**症状**：地图上原地打转，日志里梯度恒为 `N=0.00, E=0.00`。
+
+### 陷阱 2：回退绝对不能瞬移
+
+```python
+# ❌ 直接改坐标 = 20 米瞬移 → 反作弊立即终止
+self.lat, self.lon = base_lat, base_lon
+self.c.set_wgs84(base_lat, base_lon)
+
+# ✅ 用 move_meters 反向走回去，或干脆不回退（走 L 形）
 ```
-或通过命令行自主调优控制参数：
-```bash
-python campus_run.py --pace 6.0 --km 2.05 --cps 2 --auto-start --auto-finish
+
+### 陷阱 3：不要每步 set 绝对坐标
+
+```python
+# ❌ 里程跳跃式增长，配速瞬间 2'00"
+t_lat, t_lon = offset_meters(c_lat, c_lon, dn, de)
+self.c.set_wgs84(t_lat, t_lon)
+
+# ✅ 增量推进
+cur_n = (self.lat - c_lat) * mlat
+mv_n = dn - cur_n
+self.lat, self.lon = offset_meters(self.lat, self.lon, mv_n, mv_e)
 ```
 
-#### CLI 参数完整说明：
-| 参数 | 类型 | 默认值 | 参数含义与作用 |
-| :--- | :---: | :---: | :--- |
-| `--pace` | `float` | `6.0` | 目标平均配速（单位：分/公里）。`6.0` 即 `6'00"/km`，系统将动态控速锁定该值 |
-| `--km` | `float` | `2.05` | 目标总跑步里程（单位：公里）。建议略大于高校要求的 2.00 km 防止浮点误差 |
-| `--cps` | `int` | `2` | 需打卡的随机点数。跑满打卡点并达到里程后系统才允许收尾 |
-| `--auto-start` | `flag` | 开启 | 启动时自动点击 App 首页的“开始乐跑”，并全自动识别跳过各类权限提示弹窗 |
-| `--auto-finish` | `flag` | 开启 | 达标后自动长按结束按钮并确认保存，全程无需人工值守 |
-| `--vm-index` | `int` | `0` | 指定 MuMu 多开实例编号（也可通过环境变量 `MUMU_VM_INDEX` 配置）。新建 Android 12 多开实例时通常为 `1` |
-| `--start-lat` / `--start-lon` | `float` | 示例坐标 | 起始点 WGS-84 纬/经度（也可通过 `LEPAO_START_LAT` / `LEPAO_START_LON` 环境变量指定） |
+### 陷阱 4：硬编码坐标范围会锁死航向
 
-### 4. 极速离线仿真（无须模拟器）
-本项目内置了完备的离线闭环仿真测试套件，使用虚拟时钟和假 App 接口验证算法：
-```bash
-python campus_run_sim.py
+原版 `cruise()` 里：
+
+```python
+# ❌ 作者学校坐标，在其他学校永远为 False
+if not (31.6358 <= self.lat <= 31.6412 and 118.8940 <= self.lon <= 118.9005):
+    dlat = (self.default_start[0] - self.lat) * 111320.0
+    ...
+    self.cruise_heading = math.degrees(math.atan2(dlon, dlat))
 ```
-*可在 0.5 秒内极速推演 2.05km 跑步全过程，验证正交梯度下降寻路及起跑延时追赶逻辑的数学正确性。*
+
+不在该范围内时 `atan2(0,0)=0` → **航向锁死正北** → 轨迹是死直线 → 反作弊终止。
+
+### 陷阱 5：米/度系数必须统一
+
+```python
+# ❌ 错系数转出，对系数转回，几何被拉扯成椭圆
+mv_n = (t_lat - self.lat) * 111320.0     # geo.py 实际是 110765
+# ✅ 全程在米坐标系计算
+mlat, mlon = meters_per_degree(c_lat)
+```
+
+### 陷阱 6：`pythonw.exe` 下 `print` 会崩
+
+```python
+# ❌ sys.stdout 是 None，AttributeError → 进程静默退出
+print("started")
+# ✅
+if sys.stdout is not None:
+    print("started")
+```
+
+### 陷阱 7：bat 文件不要写非 ASCII `echo`
+
+`chcp 65001` 后，`echo` 行里的中文和 `①②③④` 会字节错位，把命令本身切断：
+
+```
+'ho' is not recognized as an internal or external command
+```
+
+**保持 bat 纯 ASCII。**
+
+### 陷阱 8：MuMu 重启后 adb 会掉线
+
+```python
+subprocess.run([ADB, "connect", "127.0.0.1:16384"])
+```
+
+所有检查都要先自动重连，否则误判「模拟器未连接」。
 
 ---
 
-## 🛠️ 全自动无人值守（定时任务集成）
+## 已知限制
 
-配合操作系统的“任务计划程序”（Windows Task Scheduler）或第三方定时工具，可以在每天清晨指定时段（如 06:35）静默唤醒执行：
-1. 自动调用 `MuMuManager.exe` 唤醒并拉起模拟器系统；
-2. 自动建立 ADB 本地通道并激活 GPS 定位模式；
-3. 自动进入步道乐跑、自动起跑、双打卡点寻路打卡、配速闭环调控、自动结算退出；
-4. 运行结果可重定向至日志文件（`morning_run_latest.log`），全流程零弹窗干扰。
-
----
-
-## ❓ 常见问题 (FAQ)
-
-### Q1：在 MuMu 模拟器里打开步道乐跑直接闪退怎么办？
-
-* **原因**：最新版 MuMu 模拟器默认创建的往往是 **Android 15 (API 35)** 实例。官方版步道乐跑的加固壳 `libkadp.so` 调用了 ART 底层私有符号，在 Android 15 中因 ABI 变化会直接触发 `SIGSEGV` 闪退。
-* **推荐解决方案（官方原版，无需脱壳改包）**：
-  1. 打开 **MuMu 多开器** → 点击「新建模拟器」→ 明确选择 **Android 12** 镜像创建实例；
-  2. 在该 Android 12 实例的设置中确认 **关闭 ROOT 权限**；
-  3. 若个别显卡环境仍异常，可在设置中将渲染模式切换为 **DirectX**；
-  4. 在这个 Android 12 实例中安装**官方原版**步道乐跑即可正常启动运行；
-  5. 如果新建的 Android 12 实例编号不是 `0`（例如多开编号为 `1`），运行脚本时请指定 `--vm-index`：
-     ```bash
-     python campus_run.py --vm-index 1 --pace 6.0 --km 2.05 --cps 2 --auto-start --auto-finish
-     ```
-* **关于第三方脱壳/重打包 APK**：社区中存在面向 Android 15 的脱壳重打包方案，但该类改包使用非官方签名，QQ/微信登录受限且可能带来额外风控风险。本项目坚持**官方原版、零注入/零篡改**原则，不分发也不推荐使用修改版 APK，优先通过 **MuMu Android 12 实例** 即可根治闪退。
+| 限制 | 说明 |
+|---|---|
+| **自动寻路不稳** | App 的「距打卡点」刷新滞后，三边定位/梯度都会失准。**用摇杆或路线模式。** |
+| **步数可能为 0** | 依赖网关 `shake`，MuMu 的 shake 只摇窗口。多数情况能出步数（实测 2.06km/13:59 → 1742 步），但不稳定。 |
+| **App 覆盖有限** | 步道乐跑只支持合作高校，地图能点任何地方但跑区外成绩无效。 |
+| **各校规则不同** | 里程门槛、配速区间、打卡点数需在配置里改。 |
+| **长按无法用 adb 模拟** | `input swipe` / `motionevent` 在 MuMu 上都不触发「长按暂停」，结束跑步需手动操作或 `am force-stop`。 |
+| **瓦片需联网** | 首次浏览某区域要下载（有磁盘缓存）。 |
 
 ---
 
-## 🤝 鸣谢与社区认可
+## 免责声明
 
-本项目由 **[LINUX DO 社区](https://linux.do/)** 提供交流与开源推广支持，认可并践行「真诚、友善、团结、专业」的开源极客精神！
+本项目仅供**技术研究与学习交流**，用于演示以下技术方案的工程实现：
+
+- Android 模拟器定位注入与传感器事件模拟
+- 离线 OCR 的界面状态机
+- Web Mercator 瓦片地图渲染与坐标系转换
+- 带反作弊约束的运动轨迹生成算法
+
+使用者应自行确认所在学校的考勤政策。**使用本项目产生的一切后果由使用者自行承担**，作者不对成绩有效性、账号状态或任何其他影响负责。
+
+如果学校提供了正规的体育锻炼渠道，请优先使用正规渠道。
 
 ---
 
-## ⚖️ 免责声明 (Disclaimer)
+## 致谢
 
-1. **教育与科研目的**：本项目代码及技术文档仅供个人学习 Python 自动化控制、图像处理与计算机视觉（OCR）、空间几何算法及 Android 移动端自动化测试研究之用。
-2. **严禁违规与作弊**：严禁将本项目用于任何学校体育考试作弊、商业代跑或任何侵犯步道乐跑平台服务协议的非正当用途。因不当使用该项目产生的任何纠纷、账号异常或校纪违规处罚，均由使用者本人全权承担，开发者概不负责。
-3. **健康倡议**：体育运动的本质是强健体魄与培养坚韧意志。建议同学们在清晨或课余时间走出宿舍、多参与真实健康的户外体育锻炼。
-4. **版权与调整**：本项目中涉及的所有第三方商标、Logo 与应用名称（如步道乐跑、MuMu 模拟器等）版权均归各自所有者所有。如相关方认为存在不当内容，请提交 Issue 或联系开发者进行调整。
+- 原始算法与架构：[wmuj/budao-lepao](https://github.com/wmuj/budao-lepao)
+- 离线 OCR：[RapidOCR](https://github.com/RapidAI/RapidOCR)
+- 地图瓦片：高德地图
+- 地理编码：OpenStreetMap Nominatim
 
----
+## License
 
-<div align="center">
-  <b>如果本项目对你的自动化与算法学习有所启发，欢迎点一个 ⭐ Star 支持一下！</b>
-</div>
+MIT（沿用原项目许可证，见 [LICENSE](LICENSE)）

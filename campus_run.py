@@ -23,6 +23,7 @@ import argparse
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -30,9 +31,16 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant"))
+
+# 输出统一 UTF-8，避免经 GUI 管道回传时中文乱码
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant", "src"))
 
-from lepao.geo import offset_meters                      # noqa: E402
+from lepao.geo import offset_meters, meters_per_degree   # noqa: E402
 from lepao.mumu import MuMuLocationClient, discover_mumu # noqa: E402
 from lepao.sensors import StepFeeder, cadence_for_speed  # noqa: E402
 
@@ -43,13 +51,25 @@ MANAGER = r"D:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe"
 
 PACE_MIN_S = 180.0
 PACE_MAX_S = 480.0
-V_MIN, V_MAX = 2.30, 4.40
+# 允许 GUI/环境变量覆盖（LEPAO_VMAX / LEPAO_PUSH_INTERVAL / LEPAO_READ_INTERVAL）
+V_MIN = 2.30
+V_MAX = float(os.environ.get("LEPAO_VMAX", "6.00"))
+
+# 标准 400m 跑道几何（体育场形：两直道 + 两半圆）
+LANE_STRAIGHT = 84.39      # 直道长度
+LANE_RADIUS = 36.5         # 弯道半径（内圈）
+LANE_LEN = 2 * LANE_STRAIGHT + 2 * math.pi * LANE_RADIUS   # ≈398.1m 一圈
+# MuMu 虚拟定位下发节流：App 的 GPS 采样率约 1Hz，下发间隔需与之匹配。
+# 实测接收率：200ms→52%，500ms→42%，2000ms→40%，1.0s 为最佳匹配点。
+LOCATION_PUSH_INTERVAL_S = float(os.environ.get("LEPAO_PUSH_INTERVAL", "1.0"))
 
 PROBE_M = 20.0
-STEP_MAX_M = 60.0
+# 单步位移上限：实测 >8m 且间隔短时会被步道乐跑判定为瞬移并终止跑步。
+# 原值 60m 会在打卡导航时一步跳 60 米，必然触发反作弊。
+STEP_MAX_M = 8.0
 CP_ARRIVE_M = 20.0
 CP_DWELL_S = 12.0
-READ_INTERVAL_S = 0.5
+READ_INTERVAL_S = float(os.environ.get("LEPAO_READ_INTERVAL", "0.5"))
 LAST_ERROR = None
 
 
@@ -141,6 +161,9 @@ class CampusRunner:
         self.last = time.monotonic()
         self.cruise_heading = 0.0
         self.cruise_left = 120.0
+        # 每 26 米转 23°，约 400 米一圈（标准田径场内圈），可按场地调整
+        self.turn_step = 23.0
+        self.lane_s = 0.0            # 沿标准 400m 跑道的累计距离
         self.feeder = StepFeeder(client, cadence=cadence_for_speed(self.v * 3.6),
                                  logger=lambda *_: None)
         self.watcher = StateWatcher(self._read) if watcher else None
@@ -165,8 +188,12 @@ class CampusRunner:
 
     # ---------- 运动学 ----------
     def _apply(self, dt: float):
-        dn = math.cos(math.radians(self.bearing)) * self.v * dt
-        de = math.sin(math.radians(self.bearing)) * self.v * dt
+        # 航向抖动：模拟 GPS 漂移与身体左右摆动，让轨迹呈自然弧线而非直线
+        self.bearing = (self.bearing + random.uniform(-4.0, 4.0) * dt) % 360.0
+        # 步长微扰：速度在 ±5% 内自然波动，避免恒速机器特征
+        v = self.v * random.uniform(0.95, 1.05)
+        dn = math.cos(math.radians(self.bearing)) * v * dt
+        de = math.sin(math.radians(self.bearing)) * v * dt
         self.lat, self.lon = offset_meters(self.lat, self.lon, dn, de)
         self.c.set_wgs84(self.lat, self.lon)
 
@@ -183,10 +210,10 @@ class CampusRunner:
                 st = self.state()
                 if st is not None:
                     self.update_speed(st)
-                next_ctrl = now + 2.0
+                next_ctrl = now + 5.0
             if now >= end:
                 break
-            time.sleep(max(0.0, min(0.2, end - now)))
+            time.sleep(max(0.0, min(LOCATION_PUSH_INTERVAL_S, end - now)))
 
     def move_meters(self, meters: float, bearing: float | None = None):
         if bearing is not None:
@@ -211,47 +238,165 @@ class CampusRunner:
 
     # ---------- 导航 ----------
     def bearing_to_checkpoint(self, dist: float) -> float:
+        """用「三边定位」解出打卡点坐标，再朝它走。
+
+        为什么不用梯度（原版做法）：
+          原版走 L 形后取
+              g_n = (d1-d0)/PROBE_M
+              g_e = (d2-d1)/PROBE_M
+          但 g_e 是「北 20 米处再向东」的偏导，和 g_n 不在同一点上。
+          远场近似没问题，靠近打卡点时距离场弯曲，方向会算偏，
+          表现为「先靠近、再走过头、距离反弹」。
+
+        现在的做法：走 L 形拿到三个点 (P0,P1,P2) 和三个距离 (d0,d1,d2)，
+        直接解二元二次方程组定位打卡点，再取方位角。这是精确解，不依赖近似。
+
+        历史坑（务必保留）：
+          * 回退绝不能直接改坐标 + set_wgs84 —— 那是瞬移，会被反作弊终止。
+          * PROBE_M 不能太小 —— 走 4 米仅 1.5 秒，App 距离还没刷新，读到旧值。
+        """
         s0 = self.fresh_state(time.monotonic() + 0.1) if self.watcher else None
         d0 = s0.cp_dist_m if s0 and s0.cp_dist_m is not None else dist
+
+        mlat, mlon = meters_per_degree(self.default_start[0])
+
+        def wait_refresh(extra=1.2):
+            if self.watcher:
+                self.fresh_state(time.monotonic() + extra)
+
+        # P0 = 原点；P1 = 向北 PROBE_M；P2 = P1 再向东 PROBE_M
+        p0 = (0.0, 0.0)
         self.move_meters(PROBE_M, 0.0)
-        s1 = self.fresh_state(time.monotonic() + (0.4 if self.watcher else 0.0))
+        wait_refresh()
+        s1 = self.state()
         d1 = s1.cp_dist_m if s1 and s1.cp_dist_m is not None else d0
+        p1 = (0.0, PROBE_M)
+
         self.move_meters(PROBE_M, 90.0)
-        s2 = self.fresh_state(time.monotonic() + (0.4 if self.watcher else 0.0))
+        wait_refresh()
+        s2 = self.state()
         d2 = s2.cp_dist_m if s2 and s2.cp_dist_m is not None else d1
+        p2 = (PROBE_M, PROBE_M)
+
+        # ---- 三边定位：解 (x,y) 使 |P-Pi| = di ----
+        # 以 pa 为原点展开，两式相减消去二次项，得线性方程组：
+        #   ax*x + ay*y = (ax² + ay² - db² + da²) / 2
+        #   bx*x + by*y = (bx² + by² - dc² + da²) / 2
+        # 其中 (ax,ay) = pb-pa, (bx,by) = pc-pa
+        def trilaterate(pa, da, pb, db, pc, dc):
+            ax, ay = pb[0] - pa[0], pb[1] - pa[1]
+            bx, by = pc[0] - pa[0], pc[1] - pa[1]
+            rhs_a = (ax * ax + ay * ay - db * db + da * da) / 2.0
+            rhs_b = (bx * bx + by * by - dc * dc + da * da) / 2.0
+            det = ax * by - ay * bx
+            if abs(det) < 1e-9:
+                return None
+            return ((rhs_a * by - ay * rhs_b) / det,
+                    (ax * rhs_b - rhs_a * bx) / det)
+
+        pos = None
+        if d0 and d1 and d2 and min(d0, d1, d2) > 0.5:
+            pos = trilaterate(p0, d0, p1, d1, p2, d2)
+            # 校验：解出的位置反算三个距离，误差过大就丢弃
+            if pos:
+                ex, ey = pos
+                err = max(abs(math.hypot(ex - p[0], ey - p[1]) - d)
+                          for p, d in ((p0, d0), (p1, d1), (p2, d2)))
+                if err > 15.0:
+                    self.log("三边定位误差 %.1f 米偏大，改用梯度方向" % err)
+                    pos = None
+
+        if pos is not None:
+            ex, ey = pos
+            # 解出的位置是「相对进入探测时的原点」，而当前实际位置在 (PROBE_M, PROBE_M)
+            dx, dy = ex - PROBE_M, ey - PROBE_M
+            b = math.degrees(math.atan2(dx, dy)) % 360.0     # 北为 0°，东为 90°
+            self.log("三边定位：目标偏移 (%.1f m 东, %.1f m 北)，方位 %.1f°" % (dx, dy, b))
+            return b
+
+        # ---- 兜底：梯度方向 ----
         g_n = (d1 - d0) / PROBE_M
         g_e = (d2 - d1) / PROBE_M
-        if math.hypot(g_n, g_e) < 0.08:
-            self.move_meters(PROBE_M, 180.0)
-            s3 = self.fresh_state(time.monotonic() + (0.4 if self.watcher else 0.0))
-            d3 = s3.cp_dist_m if s3 and s3.cp_dist_m is not None else d2
-            self.move_meters(PROBE_M, 270.0)
-            s4 = self.fresh_state(time.monotonic() + (0.4 if self.watcher else 0.0))
-            d4 = s4.cp_dist_m if s4 and s4.cp_dist_m is not None else d3
-            g_n = (d3 - d2) / PROBE_M
-            g_e = (d4 - d3) / PROBE_M
         if math.hypot(g_n, g_e) < 0.05:
-            b = (self.bearing + 137.0) % 360.0
+            dn_c = (self.default_start[0] - self.lat) * mlat
+            de_c = (self.default_start[1] - self.lon) * mlon
+            b = math.degrees(math.atan2(de_c, dn_c)) % 360.0
+            self.log("梯度无效（距离可能未刷新），朝跑道中心 %.1f° 回归" % b)
         else:
             b = math.degrees(math.atan2(-g_e, -g_n)) % 360.0
-        self.log("探测方位：%.1f° (ΔN=%.1fm, ΔE=%.1fm)" % (b, d1 - d0, d2 - d1))
+            self.log("探测方位（梯度）：%.1f° (N=%.2f, E=%.2f /米)" % (b, g_n, g_e))
         return b
 
-    def cruise(self, meters: float):
-        if not (31.6358 <= self.lat <= 31.6412 and 118.8940 <= self.lon <= 118.9005):
-            # 如果当前在校区外，直接朝校园田径场中心方向行进
-            dlat = (self.default_start[0] - self.lat) * 111320.0
-            dlon = (self.default_start[1] - self.lon) * 111320.0 * math.cos(math.radians(self.lat))
-            self.cruise_heading = math.degrees(math.atan2(dlon, dlat)) % 360.0
+    def _lane_pos(self, s: float):
+        """标准 400m 跑道参数化：两条直道 + 两个半圆弯道（逆时针）。
 
-        while meters > 0:
-            step = min(self.cruise_left, meters)
-            self.move_meters(step, self.cruise_heading)
-            meters -= step
-            self.cruise_left -= step
-            if self.cruise_left <= 1:
-                self.cruise_heading = (self.cruise_heading + 60.0) % 360.0
-                self.cruise_left = 100.0
+        以跑道中心为原点，北为 +y、东为 +x。
+        直道 84.39m、弯道半径 36.5m，一圈约 398.1m。
+        返回 (北向米, 东向米)。
+        """
+        A = LANE_STRAIGHT / 2.0                      # 半直道 = 42.195
+        R = LANE_RADIUS                              # 36.5
+        P1 = LANE_STRAIGHT                           # 一条直道结束
+        P2 = P1 + math.pi * R                        # + 北半圆
+        P3 = 2 * P1 + math.pi * R                    # + 西直道
+        P4 = 2 * P1 + 2 * math.pi * R                # 一圈结束
+        s = s % P4
+
+        if s < P1:                                   # 东直道：y 从 -A 到 +A
+            return (-A + s, R)
+        elif s < P2:                                 # 北半圆：θ 0→π
+            th = (s - P1) / R
+            return (A + R * math.sin(th), R * math.cos(th))
+        elif s < P3:                                 # 西直道：y 从 +A 到 -A
+            return (A - (s - P2), -R)
+        else:                                        # 南半圆：θ π→2π
+            th = math.pi + (s - P3) / R
+            return (-A + R * math.sin(th), R * math.cos(th))
+
+    def cruise(self, meters: float):
+        """沿标准 400m 跑道跑圈（增量推进，避免里程跳跃）。
+
+        关键：必须用「从当前位置挪一小步」的增量写法。
+        若每步直接 set 绝对目标坐标，步道乐跑的里程会跳变式增长
+        （实测 6 秒记 50 米 → 配速瞬间 2'00"），闭环来不及拉回就被判异常。
+        原版这里还硬编码了作者学校(31.63,118.89)的经纬度范围，会导致航向锁死正北。
+        """
+        c_lat, c_lon = self.default_start           # 跑道中心
+        m_per_lat, m_per_lon = meters_per_degree(c_lat)   # 与 offset_meters 一致的椭球系数
+        step_size = 2.5                              # 每步 2.5 米（已验证安全的节奏）
+        remaining = meters
+        next_ctrl = 0.0
+        while remaining > 0:
+            now = time.monotonic()
+            # 定期用 App 实时配速校正速度，保持闭环有效
+            if now >= next_ctrl:
+                st = self.state()
+                if st is not None:
+                    self.update_speed(st)
+                next_ctrl = now + 5.0
+
+            st_m = min(step_size, remaining)
+            self.lane_s = (self.lane_s + st_m) % (
+                2 * LANE_STRAIGHT + 2 * math.pi * LANE_RADIUS)
+            dn, de = self._lane_pos(self.lane_s)
+
+            # 全部用「米」在跑道坐标系里算，不再经 lat/lon 中转，
+            # 避免硬编码系数(111320/101300)与 geo 的椭球系数(约 110765/101359)打架导致几何变形。
+            cur_n = (self.lat - c_lat) * m_per_lat
+            cur_e = (self.lon - c_lon) * m_per_lon
+            mv_n = dn - cur_n
+            mv_e = de - cur_e
+            dist = math.hypot(mv_n, mv_e)
+            if dist > 1e-6 and dist > st_m * 2.0:
+                k = (st_m * 2.0) / dist          # 限幅，避免一步跳太远
+                mv_n *= k
+                mv_e *= k
+            mv_n += random.uniform(-0.4, 0.4)    # GPS 自然抖动
+            mv_e += random.uniform(-0.4, 0.4)
+            self.lat, self.lon = offset_meters(self.lat, self.lon, mv_n, mv_e)
+            self.c.set_wgs84(self.lat, self.lon)
+            time.sleep(st_m / max(self.v, 0.5))
+            remaining -= st_m
 
     def _punch_signal(self, st: RunState, name: str, cand):
         """判断是否已过点：目标行变成"待分配"，或目标换成另一个名字，或已打卡数增加，或打卡点距离消失。"""
