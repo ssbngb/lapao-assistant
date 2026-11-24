@@ -59,3 +59,6 @@ yunyundong/
 # ...except documentation assets
 !assets/*.png
 !assets/*.jpg
+# Local push helper (contains personal remote URL)
+推送到GitHub.bat
+
