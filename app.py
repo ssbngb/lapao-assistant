@@ -12,7 +12,9 @@
 或双击「控制台.bat」
 """
 import os, sys, math, json, time, threading, subprocess, urllib.request
-from collections import OrderedDict
+import random
+import webbrowser
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from queue import Empty, SimpleQueue
@@ -44,7 +46,8 @@ from lepao.mumu import MuMuLocationClient
 from lepao.geo import (offset_meters, haversine,
                        gcj02_to_wgs84, wgs84_to_gcj02)
 from lepao.sensors import StepFeeder, cadence_for_speed
-from lepao.track import Track, smooth_stroke, standard_stadium
+from lepao.track import Track, smooth_stroke
+from lepao.navigation import plan_return
 from screen_state import ScreenReader, read_screen_state
 
 CONFIG_PATH = os.path.join(HERE, "run_config.json")
@@ -203,6 +206,28 @@ def _route_laps(value):
     return int(text)
 
 
+def _route_speeds(base_speed):
+    """在相邻的随机目标速度之间逐步过渡，每次定位更新取一个速度。"""
+    low = max(1.0, base_speed * 0.9)
+    high = min(6.0, base_speed * 1.1)
+    speed = base_speed
+    while True:
+        target = random.uniform(low, high)
+        steps = random.randint(8, 16)
+        for i in range(1, steps + 1):
+            yield speed + (target - speed) * i / steps
+        speed = target
+
+
+def _route_distances(track):
+    """单圈按不超过 2.5 米的间距取样，并保留每段的终点。"""
+    for start, end in zip(track.cum, track.cum[1:]):
+        steps = math.ceil((end - start) / 2.5)
+        for i in range(1, steps):
+            yield start + (end - start) * (i / steps)
+        yield end
+
+
 def _interval(value, label):
     seconds = _number(value, label, 0)
     if seconds == 0 or seconds > min(threading.TIMEOUT_MAX, 2_147_483):
@@ -278,7 +303,8 @@ class Runner:
         self.client = MuMuLocationClient()
         self.config_error = ""
         self.cfg = self._load_cfg()
-        self.lat, self.lon = self.cfg["lat"], self.cfg["lon"]
+        self.trail = deque(maxlen=20000)
+        self.motion_lock = threading.Lock()
         self.bearing = None          # None = 停止
         self.speed = 2.8
         self.push_interval = self.cfg["push_interval"]
@@ -311,6 +337,40 @@ class Runner:
         with self.lock:
             self.bearing = bearing
 
+    @property
+    def home(self):
+        point = (self.cfg["lat"], self.cfg["lon"])
+        if self.cfg.get("home_set", point != (0.0, 0.0)):
+            return point
+        return None
+
+    def navigation_snapshot(self, cancel):
+        # Finish any in-flight push before reading GPS. A cancelled GPS read
+        # must neither hold up the next movement nor replace its position.
+        with self.motion_lock:
+            if cancel.is_set():
+                return None, ()
+        current = self._read_position()
+        with self.motion_lock:
+            if cancel.is_set():
+                return None, ()
+            if self.trail and haversine(*self.trail[-1], *current) > 2.5:
+                self.trail.clear()  # 模拟器已从外部移动，两段轨迹不相连
+            if not self.trail or self.trail[-1] != current:
+                self.trail.append(current)
+            return current, list(self.trail)
+
+    def _read_position(self):
+        gps = self.client.gps_status()
+        if not gps["enabled"] or gps["location"] is None:
+            raise ValueError("尚未取得模拟器 GPS 位置，请开启定位后重试")
+        return _coordinates(*gps["location"])
+
+    def _position(self):
+        if not self.trail:
+            self.trail.append(self._read_position())
+        return self.trail[-1]
+
     def halt(self):
         with self.lock:
             self.bearing = None
@@ -319,20 +379,28 @@ class Runner:
         with self.lock:
             self.speed = max(0.5, min(6.0, v))
 
-    def move_to(self, lat, lon):
-        with self.lock:
-            self.lat, self.lon = lat, lon
-        self._push(lat, lon)
-
     def _push(self, lat, lon):
-        """下发一次坐标。模拟器没开也不算致命错误，只记状态。"""
-        if self._stopped.is_set():
-            return
+        """调用方持有 motion_lock。只记录网关确认的位移。"""
         try:
             self.client.set_wgs84(lat, lon)
-            self.last_error = ""
         except Exception as e:
             self.last_error = _explain(e)
+            self.trail.clear()  # 下次移动前重新读取 GPS
+            raise
+        point = (lat, lon)
+        if self.trail:
+            self.total_m += haversine(*self.trail[-1], *point)
+        if point == self.home:
+            self.trail.clear()
+        self.trail.append(point)
+        self.last_error = ""
+
+    def move_to(self, lat, lon, cancel):
+        with self.motion_lock:
+            if cancel.is_set() or self._stopped.is_set():
+                return False
+            self._push(lat, lon)
+            return True
 
     def _loop(self):
         while not self._stopped.is_set():
@@ -347,13 +415,20 @@ class Runner:
             bb = (b + (time.time() % 7 - 3.5) * 0.6) % 360.0
             dn = math.cos(math.radians(bb)) * step
             de = math.sin(math.radians(bb)) * step
-            with self.lock:
-                if self.bearing != b or self._stopped.is_set():
-                    continue
-                self.lat, self.lon = offset_meters(self.lat, self.lon, dn, de)
-                la, lo = self.lat, self.lon
-            self._push(la, lo)
-            self.total_m += step
+            try:
+                with self.motion_lock:
+                    with self.lock:
+                        if self.bearing != b or self._stopped.is_set():
+                            continue
+                    current = self._position()
+                    with self.lock:
+                        if self.bearing != b or self._stopped.is_set():
+                            continue
+                    self._push(*offset_meters(*current, dn, de))
+            except Exception as exc:
+                self.last_error = _explain(exc)
+                self.halt()
+                self.feeder.pause()
             self._stopped.wait(iv)
 
     def shutdown(self):
@@ -436,7 +511,7 @@ class TileCache(OrderedDict):
 
 
 class MapView(tk.Canvas):
-    def __init__(self, master, on_click=None, on_stroke=None, center=None, on_stadium=None, **kw):
+    def __init__(self, master, on_click=None, on_stroke=None, center=None, **kw):
         super().__init__(master, bg="#e8e8e4", highlightthickness=0, **kw)
         self.z = 17
         base = center or (DEFAULTS["lat"], DEFAULTS["lon"])
@@ -444,8 +519,6 @@ class MapView(tk.Canvas):
         self.lat, self.lon = glat, glon
         self.on_click = on_click
         self.on_stroke = on_stroke
-        self.on_stadium = on_stadium
-        self._axis_start = None
         self.tool = "start"
         self._cache = TileCache()
         self._pil_cache = TileCache()
@@ -520,21 +593,13 @@ class MapView(tk.Canvas):
     def _press(self, e):
         if self._drag is not None:
             return
-        if self.tool == "stadium":
-            self.focus_set()
-            self._axis_start = (e.x, e.y)
-        elif self.tool == "brush" and self.on_stroke is not None:
+        if self.tool == "brush" and self.on_stroke is not None:
             self.focus_set()
             self._stroke = [(e.x, e.y)]
         else:
             self._pan_press(e)
 
     def _dragm(self, e):
-        if self._axis_start is not None:
-            self.delete("stadium_axis")
-            self.create_line(*self._axis_start, e.x, e.y, fill=ACCENT, width=2, dash=(4, 3),
-                             arrow="last", tags="stadium_axis")
-            return
         if self._stroke is None:
             self._pan_motion(e, 1)
             return
@@ -544,12 +609,6 @@ class MapView(tk.Canvas):
             self._draw_stroke()
 
     def _release(self, e):
-        if self._axis_start is not None:
-            x, y = self._axis_start
-            self._cancel_gesture()
-            angle = math.degrees(math.atan2(e.x - x, y - e.y)) if math.hypot(e.x-x, e.y-y) > 5 else None
-            self.on_stadium(*self.screen_to_latlon(x, y), angle)
-            return
         if self._stroke is None:
             if self._pan_release(e) and self.tool == "start" and not self._moved and self.on_click:
                 self.on_click(*self.screen_to_latlon(e.x, e.y))
@@ -590,12 +649,10 @@ class MapView(tk.Canvas):
 
     def _cancel_gesture(self, _e=None):
         self._drag = None
-        self._axis_start = None
-        self.delete("stadium_axis")
         self.cancel_stroke()
 
     def _pan_press(self, e):
-        if self._stroke is None and self._drag is None and self._axis_start is None:
+        if self._stroke is None and self._drag is None:
             self._drag = (e.num, e.x, e.y, self.lat, self.lon)
             self._moved = False
 
@@ -625,7 +682,7 @@ class MapView(tk.Canvas):
         self.zoom(1 if e.delta > 0 else -1, e.x, e.y)
 
     def zoom(self, step, x=None, y=None):
-        if self._stroke is not None or self._drag is not None or self._axis_start is not None:
+        if self._stroke is not None or self._drag is not None:
             return
         z = max(MIN_TILE_Z, min(MAX_TILE_Z, self.z + step))
         if z == self.z:
@@ -816,15 +873,20 @@ def search_place(query, limit=6):
 
 # ============ Tab ① 摇杆 ============
 class JoystickTab(ttk.Frame):
-    def __init__(self, master, runner):
+    def __init__(self, master, runner, navigation):
         super().__init__(master, padding=8)
         self.r = runner
+        self.navigation = navigation
+        self.direction_buttons = []
         self.keys = set()
         self.dirs = []
         self.dragging = False
         self.drag_bearing = None
         self.active = False
         self._build()
+        navigation.status.trace_add("write", self._sync_controls)
+        navigation.stop_manual = self.stop
+        self._sync_controls()
 
     def _build(self):
         info = _card(self)
@@ -872,6 +934,7 @@ class JoystickTab(ttk.Frame):
                   (2, 0, "↙ 西南", 225), (2, 1, "↓ 正南", 180), (2, 2, "↘ 东南", 135)]
         for r_, c_, txt, b in layout:
             btn = ttk.Button(g, text=txt, width=8, takefocus=False)
+            self.direction_buttons.append(btn)
             btn.grid(row=r_, column=c_, padx=3, pady=2, sticky="ew")
             btn.bind("<ButtonPress-1>", lambda e, bb=b: self._press_dir(bb))
             btn.bind("<ButtonRelease-1>", lambda e, bb=b: self._release_dir(bb))
@@ -882,15 +945,25 @@ class JoystickTab(ttk.Frame):
         row = ttk.Frame(sp, style="Surface.TFrame")
         row.pack(fill="x")
         ttk.Label(row, text="1.0", style="Muted.TLabel").pack(side="left")
-        ttk.Scale(row, from_=1.0, to=6.0, variable=self.spd, orient="horizontal",
-                  command=self._speed).pack(side="left", fill="x", expand=True, padx=4)
+        self.speed_scale = ttk.Scale(row, from_=1.0, to=6.0, variable=self.spd, orient="horizontal",
+                                     command=self._speed)
+        self.speed_scale.pack(side="left", fill="x", expand=True, padx=4)
         ttk.Label(row, text="6.0", style="Muted.TLabel").pack(side="left")
         self.lb_pace = ttk.Label(sp, text="2.8 m/s   ·   5'57\"/km", style="Accent.TLabel")
         self.lb_pace.pack(anchor="w", pady=(3, 0))
 
         act = ttk.Frame(right); act.pack(fill="x", pady=(8, 0))
-        ttk.Button(act, text="立即停下", style="Stop.TButton", command=self.stop).pack(side="left")
-        ttk.Button(act, text="复位到起点", command=self.reset).pack(side="left", padx=(6, 0))
+        ttk.Button(act, text="立即停下", style="Stop.TButton", command=self.stop_all).pack(side="left")
+        self.reset_btn = ttk.Button(act, text="复位到起点", command=self.reset)
+        self.reset_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(right, textvariable=self.navigation.status, wraplength=300).pack(anchor="w", pady=4)
+
+    def _sync_controls(self, *_):
+        busy = self.navigation.running
+        for control in [self.speed_scale, *self.direction_buttons]:
+            control.state(["disabled"] if busy else ["!disabled"])
+        self.reset_btn.state(["disabled"] if busy or self.r.home is None else ["!disabled"])
+        self.cv.configure(cursor="arrow" if busy else "hand2")
 
     def _joystick_geometry(self):
         cx = self.cv.winfo_width() / 2
@@ -923,6 +996,8 @@ class JoystickTab(ttk.Frame):
                       fill=ACCENT, outline="#9cddce", width=1)
 
     def _press(self, e):
+        if self.navigation.running:
+            return
         self.dragging = True
         self._fromxy(e.x, e.y)
 
@@ -952,11 +1027,19 @@ class JoystickTab(ttk.Frame):
         self._draw(dx, dy)
 
     def _go(self, b):
+        if self.navigation.running:
+            return
+        if not self.navigation.manual_ready:
+            self.navigation.return_home(self.spd.get(), on_arrival=self._sync)
+            return
         self.active = True
+        self.r.set_speed(self.spd.get())
         self.r.go(b)
         self.r.feeder.resume()
 
     def _press_dir(self, b):
+        if self.navigation.running:
+            return
         self.dirs.append(b)
         self._sync()
 
@@ -970,8 +1053,8 @@ class JoystickTab(ttk.Frame):
 
     def key_down(self, k):
         if k == "space":
-            self.stop(); return
-        if k in self.KM:
+            self.stop_all(); return
+        if k in self.KM and not self.navigation.running:
             self.keys.add(k); self._sync()
 
     def key_up(self, k):
@@ -1017,10 +1100,11 @@ class JoystickTab(ttk.Frame):
         self._draw(0, 0)
 
     def reset(self):
-        lat = float(self.r.cfg.get("lat", DEFAULTS["lat"]))
-        lon = float(self.r.cfg.get("lon", DEFAULTS["lon"]))
-        self.r.move_to(lat, lon)
-        self.r.total_m = 0.0
+        self.navigation.return_home(self.spd.get())
+
+    def stop_all(self):
+        self.stop()
+        self.navigation.stop()
 
     def update_state(self, st):
         if st is None:
@@ -1049,20 +1133,24 @@ class RouteTab(ttk.Frame):
         super().__init__(master, padding=8)
         self.r = runner
         self.post = post
-        self.start_wgs = (float(runner.cfg.get("lat", DEFAULTS["lat"])),
-                          float(runner.cfg.get("lon", DEFAULTS["lon"])))
         self.points_gcj = []
         self.track = None
         self.laps = tk.StringVar(value="1")
-        self.stadium_bearing = 0.0
         self.preview_timer = None
-        self._use_selected_start = False
+        self.status = tk.StringVar(value="")
+        self.manual_ready = False
+        self.planning = False
+        self.stop_manual = lambda: None
         self.running = False
         self.cancel = threading.Event()
         self.closing = False
         self._search_id = 0
         self._build()
         self._auto_load()
+
+    @property
+    def start_wgs(self):
+        return self.r.home
 
     def _build(self):
         self.columnconfigure(0, weight=1)
@@ -1101,28 +1189,36 @@ class RouteTab(ttk.Frame):
             entry = ttk.Entry(coords, textvariable=variable, width=10)
             entry.grid(row=0, column=2 * i + 1, sticky="ew", padx=(0, 8) if i == 0 else 0)
             entry.bind("<Return>", lambda e: self._jump_coord())
-        ttk.Button(search, text="跳转", command=self._jump_coord).grid(row=2, column=2, sticky="ew")
+        coord_actions = ttk.Frame(search, style="Surface.TFrame")
+        coord_actions.grid(row=2, column=2)
+        ttk.Button(coord_actions, text="跳转", command=self._jump_coord).pack(side="left")
+        self.coord_home_btn = ttk.Button(coord_actions, text="设为起点", command=self._home_from_fields)
+        self.coord_home_btn.pack(side="left", padx=(4, 0))
 
         map_card = _card(left, padding=0)
         map_card.pack(fill="both", expand=True)
         toolbar = ttk.Frame(map_card, style="Surface.TFrame", padding=(8, 5))
         toolbar.pack(fill="x")
         self.mode_v = tk.StringVar(value="brush")
-        for label, mode in (("画笔", "brush"), ("400 米跑道", "stadium"), ("选起点", "start")):
-            ttk.Radiobutton(toolbar, text=label, value=mode, variable=self.mode_v,
-                            style="Tool.TRadiobutton",
-                            command=self._insert_stadium if mode == "stadium" else self._mode
-                            ).pack(side="left", padx=(0, 4))
+        self.edit_controls = [self.coord_home_btn]
+        for label, mode in (("画笔", "brush"), ("设置起点", "start")):
+            button = ttk.Radiobutton(toolbar, text=label, value=mode, variable=self.mode_v,
+                                     style="Tool.TRadiobutton", command=self._mode)
+            button.pack(side="left", padx=(0, 4))
+            self.edit_controls.append(button)
         for label, step in (("放大 ＋", 1), ("缩小 －", -1)):
             ttk.Button(toolbar, text=label, command=lambda step=step: self.map.zoom(step)
                        ).pack(side="right", padx=(4, 0))
         self.map = MapView(map_card, on_click=self._select_start, on_stroke=self._finish_stroke,
-                           center=self.start_wgs, on_stadium=self._place_stadium, width=1, height=1)
+                           center=self.start_wgs, width=1, height=1)
         self.map.pack(fill="both", expand=True)
         self.mode_hint = ttk.Label(map_card, style="Muted.TLabel", justify="left", padding=(8, 6))
         self.mode_hint.pack(fill="x")
         self.mode_hint.bind("<Configure>",
                             lambda e: self.mode_hint.configure(wraplength=max(1, e.width - 16)))
+        self.routing_credit = ttk.Label(map_card, text="步行路网 © OpenStreetMap 贡献者 · 反馈地图问题",
+                                        style="Muted.TLabel", cursor="hand2", padding=(8, 2))
+        self.routing_credit.bind("<Button-1>", lambda _: webbrowser.open("https://www.openstreetmap.org/fixthemap"))
         self._mode()
 
         overview = _card(right, padding=10)
@@ -1136,7 +1232,7 @@ class RouteTab(ttk.Frame):
         self.lb_s.pack(anchor="w")
         repeat = ttk.Frame(overview, style="Surface.TFrame")
         repeat.pack(fill="x", pady=(2, 0))
-        ttk.Label(repeat, text="预览圈数", style="Card.TLabel").pack(side="left")
+        ttk.Label(repeat, text="重复圈数", style="Card.TLabel").pack(side="left")
         self.lap_input = ttk.Spinbox(repeat, from_=1, to=MAX_ROUTE_LAPS, textvariable=self.laps, width=4)
         self.lap_input.pack(side="left", padx=5)
         self.preview_btn = ttk.Button(repeat, text="预览", command=self.preview)
@@ -1146,16 +1242,21 @@ class RouteTab(ttk.Frame):
         sp.pack(fill="x", pady=(8, 0))
         pace = ttk.Frame(sp, style="Surface.TFrame")
         pace.pack(fill="x", pady=(0, 4))
-        ttk.Label(pace, text="跑动速度", style="Muted.TLabel").pack(side="left")
+        ttk.Label(pace, text="基准速度", style="Muted.TLabel").pack(side="left")
         self.lb_p = ttk.Label(pace, text="2.8 m/s · 5'57\"/km", style="Accent.TLabel")
         self.lb_p.pack(side="right")
         self.spd = tk.DoubleVar(value=2.8)
         row = ttk.Frame(sp, style="Surface.TFrame")
         row.pack(fill="x")
         ttk.Label(row, text="1.0", style="Muted.TLabel").pack(side="left")
-        ttk.Scale(row, from_=1.0, to=6.0, variable=self.spd, orient="horizontal",
-                  command=self._speed).pack(side="left", fill="x", expand=True, padx=4)
+        self.speed_scale = ttk.Scale(row, from_=1.0, to=6.0, variable=self.spd, orient="horizontal",
+                                     command=self._speed)
+        self.speed_scale.pack(side="left", fill="x", expand=True, padx=4)
         ttk.Label(row, text="6.0", style="Muted.TLabel").pack(side="left")
+
+        self.vary_speed = tk.BooleanVar(value=True)
+        self.speed_toggle = ttk.Checkbutton(sp, text="随机变速（±10%）", variable=self.vary_speed)
+        self.speed_toggle.pack(anchor="w", pady=(4, 0))
 
         act = _card(right, padding=10)
         act.pack(fill="x", pady=(8, 0))
@@ -1167,47 +1268,48 @@ class RouteTab(ttk.Frame):
         for i, (text, command) in enumerate((("保存路线", self.save), ("加载路线", self.load),
                                              ("清空路线", self.clear), ("查看起点", self.goto))):
             column = i % 2
-            ttk.Button(act, text=text, command=command).grid(
-                row=1 + i // 2, column=column, sticky="ew", pady=(4, 0),
-                padx=(4, 0) if column else (0, 4))
-        self._sync_run_buttons()
+            button = ttk.Button(act, text=text, command=command)
+            button.grid(row=1 + i // 2, column=column, sticky="ew", pady=(4, 0),
+                        padx=(4, 0) if column else (0, 4))
+            if text in ("加载路线", "清空路线"):
+                self.edit_controls.append(button)
+        self.home_btn = ttk.Button(act, text="回到起点", command=lambda: self.return_home(self.spd.get()))
+        self.home_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self._sync_route_controls()
         self.laps.trace_add("write", self._laps_changed)
 
         activity = _card(right, "路线日志", padding=8)
         activity.pack(fill="both", expand=True, pady=(8, 0))
         self.log = LogView(activity, height=3)
-        if self.start_wgs != (DEFAULTS["lat"], DEFAULTS["lon"]):
+        if self.start_wgs is not None:
             self._refresh_route()
 
     def _mode(self):
         mode = self.mode_v.get()
         self.map.set_tool(mode)
         hints = {"brush": "左键拖动画线，松开定稿。右键平移，滚轮缩放，Esc 取消。",
-                 "stadium": "点击地图放置跑道，从中心沿长轴拖动可调整朝向。",
-                 "start": "左键点击设起点。右键平移，滚轮缩放。"}
+                 "start": "点击地图设置摇杆和路线的共同起点，或输入 WGS-84 经纬度后点「设为起点」。"}
         self.mode_hint.config(text=hints[mode])
 
-    def _insert_stadium(self):
-        self._mode()
-        self._place_stadium(self.map.lat, self.map.lon, 0)
-
-    def _place_stadium(self, glat, glon, bearing):
-        if bearing is not None:
-            self.stadium_bearing = bearing
-        center = gcj02_to_wgs84(glon, glat)[::-1]
-        points = standard_stadium(center, self.stadium_bearing)
-        self.start_wgs = tuple(points[0])
-        self.points_gcj = [wgs84_to_gcj02(lon, lat)[::-1] for lat, lon in points[1:]]
-        self._use_selected_start = False
-        if self.map.z < 16:
-            self.map.jump_to(*center, z=17)
-        self._refresh_route()
-
-    def _sync_run_buttons(self):
-        self.run_btn.config(state="normal" if len(self.points_gcj) >= 2 and not self.running
+    def _sync_route_controls(self):
+        ready = self.track is not None and not self.running
+        distance = "—"
+        try:
+            laps = _route_laps(self.laps.get())
+            if self.track is not None:
+                total = self.track.length * laps
+                distance = f"{total:.0f} m" if total < 1000 else f"{total/1000:.2f} km"
+        except ValueError:
+            distance = "圈数无效"
+            ready = False
+        self.lb_l.config(text=distance)
+        self.run_btn.config(state="normal" if ready and len(self.points_gcj) >= 2
                             and self.preview_timer is None else "disabled")
         self.stop_btn.config(state="normal" if self.running and not self.cancel.is_set() else "disabled")
-        self.preview_btn.config(state="normal" if self.track and not self.running else "disabled")
+        self.preview_btn.config(state="normal" if ready else "disabled")
+        self.home_btn.state(["disabled"] if self.running or self.start_wgs is None else ["!disabled"])
+        for control in (self.lap_input, self.speed_scale, self.speed_toggle, *self.edit_controls):
+            control.state(["disabled"] if self.running else ["!disabled"])
 
     # ---- 搜索 ----
     def _search(self):
@@ -1271,34 +1373,58 @@ class RouteTab(ttk.Frame):
         self.map.jump_to(la, lo, z=17)
         self._log(f"跳转到坐标 ({la:.6f}, {lo:.6f})")
 
-    def _select_start(self, glat, glon):
-        lon, lat = gcj02_to_wgs84(glon, glat)
-        self.start_wgs = (lat, lon)
-        self._use_selected_start = True
+    def _home_from_fields(self):
+        try:
+            home = _coordinates(self.q_lat.get(), self.q_lon.get())
+        except ValueError as exc:
+            messagebox.showinfo("设置起点", str(exc))
+            return
+        if self.set_home(home):
+            self.goto()
+
+    def set_home(self, home):
+        if self.running or self.closing:
+            return False
+        try:
+            self.r.save_cfg({"lat": home[0], "lon": home[1], "home_set": True})
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("设置起点失败", str(exc))
+            return False
+        self.manual_ready = False
         self.mode_v.set("brush")
         self._mode()
         self._refresh_route()
+        self.status.set(f"共同起点已保存 · {home[0]:.6f}, {home[1]:.6f}")
+        return True
+
+    def _select_start(self, glat, glon):
+        self.set_home(gcj02_to_wgs84(glon, glat)[::-1])
 
     def _finish_stroke(self, points):
-        if self.closing:
+        if self.closing or self.running:
             return
-        if self._use_selected_start:
-            self.points_gcj = points
-        else:
+        if self.start_wgs is None:
             glat, glon = points[0]
-            lon, lat = gcj02_to_wgs84(glon, glat)
-            self.start_wgs = (lat, lon)
-            self.points_gcj = points[1:]
-        self._use_selected_start = False
+            if not self.set_home(gcj02_to_wgs84(glon, glat)[::-1]):
+                return
+        self.points_gcj = points
         self._refresh_route()
 
     def _refresh_route(self):
         self._stop_preview()
+        if self.start_wgs is None:
+            self.track = None
+            self.map.route_start = None
+            self.map.route_points = []
+            self.lb_s.config(text="共同起点：未设置")
+            self._laps_changed()
+            self.map.redraw()
+            return
         lat, lon = self.start_wgs
         glon, glat = wgs84_to_gcj02(lon, lat)
         self.map.route_start = (glat, glon)
         self.map.route_points = self.points_gcj
-        self.lb_s.config(text=f"起点：{lat:.6f}, {lon:.6f}")
+        self.lb_s.config(text=f"共同起点：{lat:.6f}, {lon:.6f}")
         self.track = None
         if self.points_gcj:
             coords = [self.start_wgs] + [gcj02_to_wgs84(lo, la)[::-1] for la, lo in self.points_gcj]
@@ -1309,21 +1435,12 @@ class RouteTab(ttk.Frame):
 
     def _laps_changed(self, *_):
         self._stop_preview()
-        self._sync_run_buttons()
-        try:
-            laps = _route_laps(self.laps.get())
-        except ValueError:
-            self.lb_l.config(text="圈数无效")
-            self.preview_btn.state(["disabled"])
-            return
-        total = self.track.length * laps if self.track else 0
-        distance = f"{total:.0f} m" if total < 1000 else f"{total/1000:.2f} km"
-        self.lb_l.config(text=distance if total else "—")
+        self._sync_route_controls()
 
     def preview(self):
         if self.preview_timer is not None:
             self._stop_preview()
-            self._sync_run_buttons()
+            self._sync_route_controls()
             return
         if self.track is None or self.running:
             return
@@ -1336,7 +1453,7 @@ class RouteTab(ttk.Frame):
             progress = (time.monotonic() - started) / 5.0  # five seconds per preview lap
             if progress >= laps:
                 self._stop_preview()
-                self._sync_run_buttons()
+                self._sync_route_controls()
                 self._log(f"地图预览完成：{laps} 圈")
                 return
             fraction = progress % 1
@@ -1347,7 +1464,7 @@ class RouteTab(ttk.Frame):
             self.preview_timer = self.after(40, frame)
 
         frame()
-        self._sync_run_buttons()
+        self._sync_route_controls()
 
     def _stop_preview(self):
         if self.preview_timer is None:
@@ -1367,16 +1484,21 @@ class RouteTab(ttk.Frame):
         self.lb_p.config(text=f"{v:.1f} m/s · {int(p//60)}'{int(p%60):02d}\"/km")
 
     def clear(self):
+        if self.running:
+            return
         self.map.set_tool(self.mode_v.get())
         self.points_gcj = []
-        self._use_selected_start = False
         self.laps.set("1")
         self._refresh_route()
 
     def goto(self):
-        self.map.jump_to(*self.start_wgs, z=self.map.z)
+        if self.start_wgs is not None:
+            self.map.jump_to(*self.start_wgs, z=self.map.z)
 
     def save(self):
+        if self.start_wgs is None:
+            messagebox.showinfo("保存路线", "请先设置共同起点")
+            return
         try:
             laps = _route_laps(self.laps.get())
         except ValueError as exc:
@@ -1397,6 +1519,8 @@ class RouteTab(ttk.Frame):
         if p: self._load_from(p)
 
     def _load_from(self, p):
+        if self.running:
+            return
         try:
             with open(p, encoding="utf-8") as f:
                 d = json.load(f)
@@ -1413,9 +1537,9 @@ class RouteTab(ttk.Frame):
         except (OSError, ValueError) as ex:
             self._log(f"加载失败：{ex}")
             return
-        self.start_wgs = start_wgs
+        if self.start_wgs is None and not self.set_home(start_wgs):
+            return
         self.points_gcj = points_gcj
-        self._use_selected_start = False
         self.laps.set(str(laps))
         self.mode_v.set("brush")
         self._mode()
@@ -1428,69 +1552,154 @@ class RouteTab(ttk.Frame):
             self._load_from(ROUTE_PATH)
 
     def run(self):
-        if self.running or self.closing: return
-        if len(self.points_gcj) < 2:
+        if self.running or self.closing or self.preview_timer is not None:
+            return
+        if self.track is None or len(self.points_gcj) < 2:
             messagebox.showinfo("提示", "请先用画笔画出路线")
             return
-        v = self.spd.get()
-        seq = [self.start_wgs]
-        seq.extend(gcj02_to_wgs84(lo, la)[::-1] for la, lo in self.points_gcj)
-        seq.append(self.start_wgs)
-        self.running = True
-        self.cancel.clear()
-        self._sync_run_buttons()
-        self.r.feeder.resume()
-        threading.Thread(target=self._worker, args=(v, seq), daemon=True).start()
-
-    def _worker(self, v, seq):
         try:
-            if self.cancel.is_set():
+            laps = _route_laps(self.laps.get())
+        except ValueError as exc:
+            messagebox.showinfo("圈数", str(exc))
+            return
+        self._start_motion(self.spd.get(), laps, self.vary_speed.get())
+
+    def return_home(self, speed, on_arrival=None):
+        self._start_motion(speed, 0, False, on_arrival)
+
+    def _start_motion(self, speed, laps, vary_speed, on_arrival=None):
+        if self.running or self.closing:
+            return
+        home = self.start_wgs
+        if home is None:
+            self.status.set("请先点击窗口顶部的「设置起点」")
+            return
+        if on_arrival is None:
+            self.stop_manual()
+        self.r.halt()
+        self._stop_preview()
+        course = self.track
+        cancel = self.cancel = threading.Event()
+        self.running = True
+        self.planning = True
+        self._sync_route_controls()
+        self._show_progress("正在规划到共同起点的路线…")
+
+        def plan():
+            try:
+                current, trail = self.r.navigation_snapshot(cancel)
+                if cancel.is_set():
+                    return
+                approach, source = plan_return(current, home, course, trail, cancel)
+            except Exception as exc:
+                msg = f"返程规划失败 · {_explain(exc)}"
+                self.post(lambda: self._run_finished(cancel, msg))
                 return
-            self._log("="*36)
-            self._log(f"沿路线跑：{len(seq)-1} 段 @ {v:.1f} m/s")
-            self.r.move_to(*seq[0])
+            def begin():
+                if cancel.is_set() or self.closing:
+                    return
+                self.planning = False
+                self.manual_ready = True
+                if approach is None and not laps:
+                    self._run_finished(cancel, "已在共同起点")
+                    if on_arrival:
+                        on_arrival()
+                    return
+                if approach is not None:
+                    if source == "步行路网":
+                        self.routing_credit.pack(anchor="w")
+                    self._log(f"返回共同起点 · {source} · {approach.length:.0f} m")
+                    self._show_progress(f"正在回到起点 · 剩余 {approach.length:.0f} m")
+                self.r.feeder.set_cadence(cadence_for_speed(speed * 3.6))
+                self.r.feeder.resume()
+                args = (cancel, approach, course, laps, speed, vary_speed, on_arrival)
+                threading.Thread(target=self._worker, args=args, daemon=True).start()
+            self.post(begin)
+        threading.Thread(target=plan, daemon=True).start()
+
+    def _walk(self, cancel, track, base_speed, speeds, lap, laps):
+        distance = 0.0
+        sent_at = time.monotonic()
+        for next_distance in _route_distances(track):
+            speed = next(speeds) if speeds is not None else base_speed
+            due = sent_at + (next_distance - distance) / speed
+            if cancel.wait(max(0.0, due - time.monotonic())):
+                break
+            point = track.position_at(next_distance)
+            sent_at = time.monotonic()
+            if not self.r.move_to(*point, cancel):
+                break
+            distance = next_distance
+            progress = (f"沿路线跑 · 第 {lap}/{laps} 圈" if lap else
+                        f"正在回到起点 · 剩余 {track.length - distance:.0f} m")
+            self._robot(point, f"{progress} · {speed:.2f} m/s")
+        return distance
+
+    def _worker(self, cancel, approach, track, laps, base_speed, vary_speed, on_arrival):
+        result = "已回到共同起点"
+        try:
+            if approach is not None:
+                self._walk(cancel, approach, base_speed, None, 0, 0)
+            if laps and not cancel.is_set():
+                mode = "随机变速" if vary_speed else "匀速"
+                self._log(f"沿路线跑：{laps} 圈，单圈 {track.length:.0f} m，{mode}，基准 {base_speed:.1f} m/s")
+            speeds = _route_speeds(base_speed) if vary_speed else None
             total = 0.0
-            for i in range(len(seq)-1):
-                if self.cancel.is_set(): break
-                la0, lo0 = seq[i]; la1, lo1 = seq[i+1]
-                seg = haversine(la0, lo0, la1, lo1)
-                if seg < 0.5: continue
-                self._log(f"  段{i+1}/{len(seq)-1} {seg:.0f}m")
-                steps = max(1, int(seg/2.5))
-                for k in range(1, steps+1):
-                    if self.cancel.is_set(): break
-                    t = k/steps
-                    la = la0 + (la1-la0)*t
-                    lo = lo0 + (lo1-lo0)*t
-                    self.r.move_to(la, lo)
-                    self._robot(la, lo)
-                    total += seg/steps
-                    if self.cancel.wait(seg/steps/max(v, 0.5)):
-                        break
-            status = "已停止" if self.cancel.is_set() else "结束"
-            self._log(f"{status}，推进 {total:.0f} m")
+            for lap in range(1, laps + 1):
+                if cancel.is_set():
+                    break
+                total += self._walk(cancel, track, base_speed, speeds, lap, laps)
+                if cancel.is_set():
+                    break
+                self._log(f"已完成第 {lap}/{laps} 圈，累计 {total:.0f} m")
+            if laps:
+                result = f"路线结束 · {laps} 圈，共 {total:.0f} m"
         except Exception as ex:
-            self._log(f"[出错] {ex}")
+            result = f"跑动失败 · {_explain(ex)}"
+            on_arrival = None
         finally:
             self.r.feeder.pause()
-            self.post(self._run_finished)
+            def finish():
+                self._run_finished(cancel, result)
+                if on_arrival and not cancel.is_set() and not self.closing:
+                    on_arrival()
+            self.post(finish)
 
-    def _run_finished(self):
+    def _run_finished(self, cancel, message):
+        if not self.running or cancel is not self.cancel:
+            return
+        if cancel.is_set():
+            message = "已停止，可从当前位置继续"
+        self.manual_ready = True
+        self.planning = False
         self.running = False
-        self._sync_run_buttons()
+        self._sync_route_controls()
+        self._mode()
+        self.status.set(message)
+        self._log(message)
 
-    def _robot(self, la, lo):
+    def _show_progress(self, message):
+        self.status.set(message)
+        self.mode_hint.config(text=message)
+
+    def _robot(self, point, message):
+        la, lo = point
         glon, glat = wgs84_to_gcj02(lo, la)
         def put():
             self.map.robot = (glat, glon)
+            self._show_progress(message)
             self.map.redraw()
         self.post(put)
 
     def stop(self):
         if self.running:
             self.cancel.set()
+            self.manual_ready = True
             self.r.feeder.pause()
-            self._sync_run_buttons()
+            if self.planning:
+                self._run_finished(self.cancel, "")
+            else:
+                self._sync_route_controls()
 
     def _log(self, m):
         self.post(lambda: self.log.append(time.strftime("[%H:%M:%S] ") + m + "\n"))
@@ -1514,8 +1723,7 @@ class ToolsTab(ttk.Frame):
         self.vars = {}
         fields = ttk.Frame(cfg, style="Surface.TFrame")
         fields.pack(fill="x")
-        items = (("起始纬度", "lat"), ("起始经度", "lon"),
-                 ("定位下发间隔（秒）", "push_interval"), ("读屏间隔（秒）", "read_interval"))
+        items = (("定位下发间隔（秒）", "push_interval"), ("读屏间隔（秒）", "read_interval"))
         for label, key in items:
             variable = tk.StringVar(value=str(self.r.cfg.get(key, DEFAULTS[key])))
             self.vars[key] = variable
@@ -1653,14 +1861,18 @@ class App:
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=8, pady=(7, 0))
 
-        self.t_joy = JoystickTab(nb, self.r)
         self.t_route = RouteTab(nb, self.r, self._messages.put)
+        self.t_joy = JoystickTab(nb, self.r, self.t_route)
         self.t_tools = ToolsTab(nb, self.r, self._messages.put)
 
         nb.add(self.t_joy, text="摇杆")
         nb.add(self.t_route, text="路线")
         nb.add(self.t_tools, text="工具")
         self.nb = nb
+        self.set_home_btn = ttk.Button(header, text="设置起点", command=self._choose_home)
+        self.set_home_btn.pack(side="left", padx=12)
+        self.t_route.status.trace_add("write", lambda *_: self.set_home_btn.state(
+            ["disabled"] if self.t_route.running else ["!disabled"]))
         # 页签切换时强制重绘地图：MapView 创建时所在页签未显示，拿不到真实尺寸
         nb.bind("<<NotebookTabChanged>>", self._on_tab)
 
@@ -1671,6 +1883,16 @@ class App:
         self._tick()
         self._poll()
         self._drain()
+
+    def _choose_home(self):
+        if self._closing or self.t_route.running:
+            return
+        self.nb.select(self.t_route)
+        self.t_joy.stop()
+        self.t_route._stop_preview()
+        self.t_route._sync_route_controls()
+        self.t_route.mode_v.set("start")
+        self.t_route._mode()
 
     def _on_tab(self, _e=None):
         """切到路线页时，等布局完成再重绘地图。"""
@@ -1690,7 +1912,12 @@ class App:
         self.t_route.map.redraw()
 
     def _kd(self, e):
-        if not self._closing and self.nb.select() == str(self.t_joy) and not self.t_route.running:
+        if self._closing:
+            return
+        if e.keysym == "space" and self.t_route.running:
+            self.t_route.stop()
+            return "break"
+        if self.nb.select() == str(self.t_joy):
             self.t_joy.key_down(e.keysym.lower())
 
     def _ku(self, e):

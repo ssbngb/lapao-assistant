@@ -1,7 +1,7 @@
 """跑道建模：N 个顶点 -> 闭合路径 -> 按里程插值。"""
 import math
 
-from .geo import haversine, meters_per_degree, offset_meters
+from .geo import haversine, meters_per_degree
 
 
 def smooth_stroke(points, spacing=12.0):
@@ -51,19 +51,6 @@ def smooth_stroke(points, spacing=12.0):
             curve.append((u*u*sx + 2*u*t*x + t*t*end[0],
                           u*u*sy + 2*u*t*y + t*t*end[1]))
     return curve
-
-
-def standard_stadium(center, bearing=0.0):
-    """A 400 m stadium template, with its long axis clockwise from north."""
-    straight = 84.39
-    radius = (400 - 2 * straight) / (2 * math.pi)
-    half = straight / 2
-    angle = math.radians(bearing)
-    c, s = math.cos(angle), math.sin(angle)
-    anchors = [offset_meters(*center, n*c - e*s, n*s + e*c)
-               for n, e in ((half+radius, 0), (half, radius), (-half, radius),
-                            (-half-radius, 0), (-half, -radius), (half, -radius))]
-    return stadium_waypoints(anchors, arc_segments=32, straight_segments=1)
 
 
 def stadium_waypoints(anchors, margin_m=0.0, arc_segments=64, straight_segments=48):
@@ -222,6 +209,8 @@ class Track:
     # ---------- sampling ----------
     def position_at(self, distance_m):
         """按里程取点，自动循环。"""
+        if not self.closed and distance_m >= self.length:
+            return self.path[-1]
         d = distance_m % self.length if self.closed else max(0.0, min(distance_m, self.length))
         lo, hi = 0, len(self.cum) - 1
         while lo < hi - 1:
