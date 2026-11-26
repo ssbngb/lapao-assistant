@@ -44,6 +44,7 @@ from lepao.mumu import MuMuLocationClient
 from lepao.geo import (offset_meters, haversine,
                        gcj02_to_wgs84, wgs84_to_gcj02)
 from lepao.sensors import StepFeeder, cadence_for_speed
+from lepao.track import Track, smooth_stroke, standard_stadium
 from screen_state import ScreenReader, read_screen_state
 
 CONFIG_PATH = os.path.join(HERE, "run_config.json")
@@ -58,6 +59,7 @@ TILE_CACHE_SIZE = 128
 TILE_RETRY_S = 15
 BRUSH_SAMPLE_PX = 4
 BRUSH_MIN_LENGTH_PX = 8
+MAX_ROUTE_LAPS = 200
 PYTHON = (os.path.join(os.path.dirname(sys.executable), "python.exe")
           if os.path.basename(sys.executable).lower() == "pythonw.exe"
           else sys.executable)
@@ -192,6 +194,13 @@ def _number(value, label, minimum, maximum=None):
 
 def _coordinates(lat, lon):
     return _number(lat, "纬度", -90, 90), _number(lon, "经度", -180, 180)
+
+
+def _route_laps(value):
+    text = str(value).strip()
+    if not text.isascii() or not text.isdecimal() or len(text) > 3 or not 1 <= int(text) <= MAX_ROUTE_LAPS:
+        raise ValueError(f"圈数须为 1～{MAX_ROUTE_LAPS} 的整数")
+    return int(text)
 
 
 def _interval(value, label):
@@ -427,7 +436,7 @@ class TileCache(OrderedDict):
 
 
 class MapView(tk.Canvas):
-    def __init__(self, master, on_click=None, on_stroke=None, center=None, **kw):
+    def __init__(self, master, on_click=None, on_stroke=None, center=None, on_stadium=None, **kw):
         super().__init__(master, bg="#e8e8e4", highlightthickness=0, **kw)
         self.z = 17
         base = center or (DEFAULTS["lat"], DEFAULTS["lon"])
@@ -435,6 +444,9 @@ class MapView(tk.Canvas):
         self.lat, self.lon = glat, glon
         self.on_click = on_click
         self.on_stroke = on_stroke
+        self.on_stadium = on_stadium
+        self._axis_start = None
+        self.tool = "start"
         self._cache = TileCache()
         self._pil_cache = TileCache()
         self._placeholder = TileCache()
@@ -447,12 +459,12 @@ class MapView(tk.Canvas):
         self._closed = False
         self._drag = None
         self._moved = False
-        self._brush = False
         self._stroke = None
         self._stroke_item = None
         self.route_start = None
         self.route_points = []
         self.robot = None
+        self.preview_point = None
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._dragm)
         self.bind("<ButtonRelease-1>", self._release)
@@ -460,7 +472,7 @@ class MapView(tk.Canvas):
         self.bind("<B3-Motion>", lambda e: self._pan_motion(e, 3))
         self.bind("<ButtonRelease-3>", self._pan_release)
         self.bind("<MouseWheel>", self._wheel)
-        self.bind("<Escape>", lambda e: self.cancel_stroke())
+        self.bind("<Escape>", self._cancel_gesture)
         self.bind("<Unmap>", self._cancel_gesture)
         self.bind("<Configure>", self._resize)
         # Tk 的 after() 不能在下载线程里调，改由主线程轮询补画
@@ -508,13 +520,21 @@ class MapView(tk.Canvas):
     def _press(self, e):
         if self._drag is not None:
             return
-        if self._brush and self.on_stroke is not None:
+        if self.tool == "stadium":
+            self.focus_set()
+            self._axis_start = (e.x, e.y)
+        elif self.tool == "brush" and self.on_stroke is not None:
             self.focus_set()
             self._stroke = [(e.x, e.y)]
         else:
             self._pan_press(e)
 
     def _dragm(self, e):
+        if self._axis_start is not None:
+            self.delete("stadium_axis")
+            self.create_line(*self._axis_start, e.x, e.y, fill=ACCENT, width=2, dash=(4, 3),
+                             arrow="last", tags="stadium_axis")
+            return
         if self._stroke is None:
             self._pan_motion(e, 1)
             return
@@ -524,8 +544,14 @@ class MapView(tk.Canvas):
             self._draw_stroke()
 
     def _release(self, e):
+        if self._axis_start is not None:
+            x, y = self._axis_start
+            self._cancel_gesture()
+            angle = math.degrees(math.atan2(e.x - x, y - e.y)) if math.hypot(e.x-x, e.y-y) > 5 else None
+            self.on_stadium(*self.screen_to_latlon(x, y), angle)
+            return
         if self._stroke is None:
-            if self._pan_release(e) and not self._moved and self.on_click:
+            if self._pan_release(e) and self.tool == "start" and not self._moved and self.on_click:
                 self.on_click(*self.screen_to_latlon(e.x, e.y))
             return
         points = self._stroke
@@ -535,20 +561,7 @@ class MapView(tk.Canvas):
         self.cancel_stroke()
         if sum(map(math.dist, points, points[1:])) < BRUSH_MIN_LENGTH_PX:
             return
-        # Round corners in the saved path, while leaving the endpoints in place.
-        smooth = [points[0]]
-        for (x1, y1), (x2, y2) in zip(points, points[1:]):
-            inset = min(0.25, BRUSH_SAMPLE_PX / math.dist((x1, y1), (x2, y2)))
-            dx, dy = inset * (x2 - x1), inset * (y2 - y1)
-            outgoing = (x1 + dx, y1 + dy)
-            if len(smooth) > 1:
-                # Midpoint of the quadratic curve through this corner.
-                before_x, before_y = smooth[-1]
-                smooth.append(((before_x + 2 * x1 + outgoing[0]) / 4,
-                               (before_y + 2 * y1 + outgoing[1]) / 4))
-            smooth.extend((outgoing, (x2 - dx, y2 - dy)))
-        smooth.append(points[-1])
-        self.on_stroke([self.screen_to_latlon(*point) for point in smooth])
+        self.on_stroke([self.screen_to_latlon(*point) for point in smooth_stroke(points)])
 
     def _brush_point(self, e):
         return (max(0, min(e.x, self.winfo_width() - 1)),
@@ -557,17 +570,17 @@ class MapView(tk.Canvas):
     def _draw_stroke(self):
         if self._stroke is None or len(self._stroke) < 2:
             return
-        coords = [coordinate for point in self._stroke for coordinate in point]
+        coords = [coordinate for point in smooth_stroke(self._stroke) for coordinate in point]
         if self._stroke_item is None:
             self._stroke_item = self.create_line(
                 coords, fill="#1264db", width=3, capstyle="round", joinstyle="round")
         else:
             self.coords(self._stroke_item, *coords)
 
-    def set_brush(self, enabled):
+    def set_tool(self, tool):
         self._cancel_gesture()
-        self._brush = enabled
-        self.configure(cursor="crosshair" if enabled else "")
+        self.tool = tool
+        self.configure(cursor="" if tool == "pan" else "crosshair")
 
     def cancel_stroke(self):
         self._stroke = None
@@ -577,10 +590,12 @@ class MapView(tk.Canvas):
 
     def _cancel_gesture(self, _e=None):
         self._drag = None
+        self._axis_start = None
+        self.delete("stadium_axis")
         self.cancel_stroke()
 
     def _pan_press(self, e):
-        if self._stroke is None and self._drag is None:
+        if self._stroke is None and self._drag is None and self._axis_start is None:
             self._drag = (e.num, e.x, e.y, self.lat, self.lon)
             self._moved = False
 
@@ -610,7 +625,7 @@ class MapView(tk.Canvas):
         self.zoom(1 if e.delta > 0 else -1, e.x, e.y)
 
     def zoom(self, step, x=None, y=None):
-        if self._stroke is not None or self._drag is not None:
+        if self._stroke is not None or self._drag is not None or self._axis_start is not None:
             return
         z = max(MIN_TILE_Z, min(MAX_TILE_Z, self.z + step))
         if z == self.z:
@@ -760,6 +775,14 @@ class MapView(tk.Canvas):
             self.create_oval(x-8, y-8, x+8, y+8, fill="#22cc66", outline="white", width=2)
             self.create_text(x, y+18, text="你", fill="#108040",
                              font=("Microsoft YaHei UI", 9, "bold"))
+        self.draw_preview_point()
+
+    def draw_preview_point(self):
+        self.delete("preview_point")
+        if self.preview_point is not None:
+            x, y = self.latlon_to_screen(*self.preview_point)
+            self.create_oval(x-6, y-6, x+6, y+6, fill="#723fc1", outline="white", width=2,
+                             tags="preview_point")
 
 
 # ============ 地名搜索（OSM Nominatim） ============
@@ -1029,6 +1052,10 @@ class RouteTab(ttk.Frame):
         self.start_wgs = (float(runner.cfg.get("lat", DEFAULTS["lat"])),
                           float(runner.cfg.get("lon", DEFAULTS["lon"])))
         self.points_gcj = []
+        self.track = None
+        self.laps = tk.StringVar(value="1")
+        self.stadium_bearing = 0.0
+        self.preview_timer = None
         self._use_selected_start = False
         self.running = False
         self.cancel = threading.Event()
@@ -1081,15 +1108,16 @@ class RouteTab(ttk.Frame):
         toolbar = ttk.Frame(map_card, style="Surface.TFrame", padding=(8, 5))
         toolbar.pack(fill="x")
         self.mode_v = tk.StringVar(value="brush")
-        for label, mode in (("画笔", "brush"), ("选起点", "start")):
+        for label, mode in (("画笔", "brush"), ("400 米跑道", "stadium"), ("选起点", "start")):
             ttk.Radiobutton(toolbar, text=label, value=mode, variable=self.mode_v,
-                            style="Tool.TRadiobutton", command=self._mode
+                            style="Tool.TRadiobutton",
+                            command=self._insert_stadium if mode == "stadium" else self._mode
                             ).pack(side="left", padx=(0, 4))
         for label, step in (("放大 ＋", 1), ("缩小 －", -1)):
             ttk.Button(toolbar, text=label, command=lambda step=step: self.map.zoom(step)
                        ).pack(side="right", padx=(4, 0))
         self.map = MapView(map_card, on_click=self._select_start, on_stroke=self._finish_stroke,
-                           center=self.start_wgs, width=1, height=1)
+                           center=self.start_wgs, on_stadium=self._place_stadium, width=1, height=1)
         self.map.pack(fill="both", expand=True)
         self.mode_hint = ttk.Label(map_card, style="Muted.TLabel", justify="left", padding=(8, 6))
         self.mode_hint.pack(fill="x")
@@ -1101,13 +1129,18 @@ class RouteTab(ttk.Frame):
         overview.pack(fill="x")
         distance = ttk.Frame(overview, style="Surface.TFrame")
         distance.pack(fill="x", pady=(0, 4))
-        ttk.Label(distance, text="全程距离\n含返回起点", style="Muted.TLabel").pack(side="left")
+        ttk.Label(distance, text="计划总距离\n含返回起点", style="Muted.TLabel").pack(side="left")
         self.lb_l = ttk.Label(distance, text="—", style="Distance.TLabel")
         self.lb_l.pack(side="right")
         self.lb_s = ttk.Label(overview, text="起点：未选", style="Muted.TLabel")
         self.lb_s.pack(anchor="w")
-        self.lb_n = ttk.Label(overview, text="路线点：0", style="Muted.TLabel")
-        self.lb_n.pack(anchor="w", pady=(2, 0))
+        repeat = ttk.Frame(overview, style="Surface.TFrame")
+        repeat.pack(fill="x", pady=(2, 0))
+        ttk.Label(repeat, text="预览圈数", style="Card.TLabel").pack(side="left")
+        self.lap_input = ttk.Spinbox(repeat, from_=1, to=MAX_ROUTE_LAPS, textvariable=self.laps, width=4)
+        self.lap_input.pack(side="left", padx=5)
+        self.preview_btn = ttk.Button(repeat, text="预览", command=self.preview)
+        self.preview_btn.pack(side="right")
 
         sp = _card(right, padding=10)
         sp.pack(fill="x", pady=(8, 0))
@@ -1138,6 +1171,7 @@ class RouteTab(ttk.Frame):
                 row=1 + i // 2, column=column, sticky="ew", pady=(4, 0),
                 padx=(4, 0) if column else (0, 4))
         self._sync_run_buttons()
+        self.laps.trace_add("write", self._laps_changed)
 
         activity = _card(right, "路线日志", padding=8)
         activity.pack(fill="both", expand=True, pady=(8, 0))
@@ -1146,15 +1180,34 @@ class RouteTab(ttk.Frame):
             self._refresh_route()
 
     def _mode(self):
-        brush = self.mode_v.get() == "brush"
-        self.map.set_brush(brush)
-        hint = ("左键拖动画线，重画会替换。右键平移，滚轮缩放，Esc 取消。"
-                if brush else "左键点击设起点。右键平移，滚轮缩放。")
-        self.mode_hint.config(text=hint)
+        mode = self.mode_v.get()
+        self.map.set_tool(mode)
+        hints = {"brush": "左键拖动画线，松开定稿。右键平移，滚轮缩放，Esc 取消。",
+                 "stadium": "点击地图放置跑道，从中心沿长轴拖动可调整朝向。",
+                 "start": "左键点击设起点。右键平移，滚轮缩放。"}
+        self.mode_hint.config(text=hints[mode])
+
+    def _insert_stadium(self):
+        self._mode()
+        self._place_stadium(self.map.lat, self.map.lon, 0)
+
+    def _place_stadium(self, glat, glon, bearing):
+        if bearing is not None:
+            self.stadium_bearing = bearing
+        center = gcj02_to_wgs84(glon, glat)[::-1]
+        points = standard_stadium(center, self.stadium_bearing)
+        self.start_wgs = tuple(points[0])
+        self.points_gcj = [wgs84_to_gcj02(lon, lat)[::-1] for lat, lon in points[1:]]
+        self._use_selected_start = False
+        if self.map.z < 16:
+            self.map.jump_to(*center, z=17)
+        self._refresh_route()
 
     def _sync_run_buttons(self):
-        self.run_btn.config(state="normal" if len(self.points_gcj) >= 2 and not self.running else "disabled")
+        self.run_btn.config(state="normal" if len(self.points_gcj) >= 2 and not self.running
+                            and self.preview_timer is None else "disabled")
         self.stop_btn.config(state="normal" if self.running and not self.cancel.is_set() else "disabled")
+        self.preview_btn.config(state="normal" if self.track and not self.running else "disabled")
 
     # ---- 搜索 ----
     def _search(self):
@@ -1240,25 +1293,71 @@ class RouteTab(ttk.Frame):
         self._refresh_route()
 
     def _refresh_route(self):
+        self._stop_preview()
         lat, lon = self.start_wgs
         glon, glat = wgs84_to_gcj02(lon, lat)
         self.map.route_start = (glat, glon)
         self.map.route_points = self.points_gcj
         self.lb_s.config(text=f"起点：{lat:.6f}, {lon:.6f}")
-        self._len()
-        self._sync_run_buttons()
+        self.track = None
+        if self.points_gcj:
+            coords = [self.start_wgs] + [gcj02_to_wgs84(lo, la)[::-1] for la, lo in self.points_gcj]
+            if any(haversine(*self.start_wgs, *point) > 0.001 for point in coords[1:]):
+                self.track = Track(coords, closed=True, corner_radius_m=0)
+        self._laps_changed()
         self.map.redraw()
 
-    def _len(self):
-        self.lb_n.config(text=f"路线点：{len(self.points_gcj)}")
-        seq = [self.start_wgs] + [gcj02_to_wgs84(lo, la)[::-1] for la, lo in self.points_gcj]
-        if len(seq) >= 2:
-            tot = sum(haversine(*seq[i], *seq[i+1]) for i in range(len(seq)-1))
-            if len(seq) >= 3:
-                tot += haversine(*seq[-1], *seq[0])
-            self.lb_l.config(text=f"{tot:.0f} m" if tot < 1000 else f"{tot/1000:.2f} km")
-        else:
-            self.lb_l.config(text="—")
+    def _laps_changed(self, *_):
+        self._stop_preview()
+        self._sync_run_buttons()
+        try:
+            laps = _route_laps(self.laps.get())
+        except ValueError:
+            self.lb_l.config(text="圈数无效")
+            self.preview_btn.state(["disabled"])
+            return
+        total = self.track.length * laps if self.track else 0
+        distance = f"{total:.0f} m" if total < 1000 else f"{total/1000:.2f} km"
+        self.lb_l.config(text=distance if total else "—")
+
+    def preview(self):
+        if self.preview_timer is not None:
+            self._stop_preview()
+            self._sync_run_buttons()
+            return
+        if self.track is None or self.running:
+            return
+        laps = _route_laps(self.laps.get())
+        started = time.monotonic()
+        self.preview_btn.config(text="停止预览")
+        self._log(f"地图预览：{laps} 圈，单圈 {self.track.length:.0f} m")
+
+        def frame():
+            progress = (time.monotonic() - started) / 5.0  # five seconds per preview lap
+            if progress >= laps:
+                self._stop_preview()
+                self._sync_run_buttons()
+                self._log(f"地图预览完成：{laps} 圈")
+                return
+            fraction = progress % 1
+            lat, lon = self.track.position_at(self.track.length * fraction)
+            self.map.preview_point = wgs84_to_gcj02(lon, lat)[::-1]
+            self.map.draw_preview_point()
+            self.mode_hint.config(text=f"地图预览 · 第 {int(progress)+1}/{laps} 圈")
+            self.preview_timer = self.after(40, frame)
+
+        frame()
+        self._sync_run_buttons()
+
+    def _stop_preview(self):
+        if self.preview_timer is None:
+            return
+        self.after_cancel(self.preview_timer)
+        self.preview_timer = None
+        self.map.preview_point = None
+        self.map.draw_preview_point()
+        self.preview_btn.config(text="预览")
+        self._mode()
 
     def _speed(self, _=None):
         v = self.spd.get()
@@ -1268,19 +1367,26 @@ class RouteTab(ttk.Frame):
         self.lb_p.config(text=f"{v:.1f} m/s · {int(p//60)}'{int(p%60):02d}\"/km")
 
     def clear(self):
-        self.map.cancel_stroke()
+        self.map.set_tool(self.mode_v.get())
         self.points_gcj = []
+        self._use_selected_start = False
+        self.laps.set("1")
         self._refresh_route()
 
     def goto(self):
         self.map.jump_to(*self.start_wgs, z=self.map.z)
 
     def save(self):
+        try:
+            laps = _route_laps(self.laps.get())
+        except ValueError as exc:
+            messagebox.showinfo("圈数", str(exc))
+            return
         p = filedialog.asksaveasfilename(defaultextension=".json", initialfile="route.json",
                                          initialdir=HERE, filetypes=[("JSON", "*.json")])
         if not p: return
         try:
-            _save_json(p, {"start_wgs": self.start_wgs, "points_gcj": self.points_gcj})
+            _save_json(p, {"start_wgs": self.start_wgs, "points_gcj": self.points_gcj, "laps": laps})
         except (OSError, ValueError) as exc:
             self._log(f"保存失败：{exc}")
             return
@@ -1303,12 +1409,16 @@ class RouteTab(ttk.Frame):
                 raise ValueError("起点和路线点必须包含两个坐标")
             start_wgs = _coordinates(*start)
             points_gcj = [_coordinates(*point) for point in points]
+            laps = _route_laps(d.get("laps", 1))
         except (OSError, ValueError) as ex:
             self._log(f"加载失败：{ex}")
             return
         self.start_wgs = start_wgs
         self.points_gcj = points_gcj
         self._use_selected_start = False
+        self.laps.set(str(laps))
+        self.mode_v.set("brush")
+        self._mode()
         self._refresh_route()
         self.goto()
         self._log(f"已加载 {os.path.basename(p)}：{len(self.points_gcj)} 点")
@@ -1515,6 +1625,7 @@ class App:
 
         self.reader = None
         self._reading = False
+        self._retry_delay = 0
         self._read_timer = None
         self._map_timer = None
         self._tick_timer = None
@@ -1590,6 +1701,7 @@ class App:
         if self._closing:
             return
         self._reset_reader = True
+        self._retry_delay = 0
         self.reader = None
         self._read_error = ""
         self._show_connection()
@@ -1669,11 +1781,15 @@ class App:
         self._reading = False
         if self._closing:
             return
+        if self._reset_reader:
+            self._read_timer = self.root.after_idle(self._poll)
+            return
         self.reader = reader
         self._read_error = error
         self._show_connection()
         self.t_joy.update_state(state)
-        delay = 0 if self._reset_reader else max(1, int(1000 * self.r.cfg["read_interval"]))
+        self._retry_delay = min(15, max(2, self._retry_delay * 2)) if error else 0
+        delay = max(1, int(1000 * max(self.r.cfg["read_interval"], self._retry_delay)))
         self._read_timer = self.root.after(delay, self._poll)
 
     def _drain(self):
@@ -1707,6 +1823,7 @@ class App:
                     self.root.after_cancel(timer)
             self._read_timer = self._map_timer = self._tick_timer = None
             self.t_route.closing = True
+            self.t_route._stop_preview()
             self.t_joy.stop()
             self.t_route.stop()
             self.t_route.map.close()

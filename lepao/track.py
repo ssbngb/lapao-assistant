@@ -1,7 +1,69 @@
 """跑道建模：N 个顶点 -> 闭合路径 -> 按里程插值。"""
 import math
 
-from .geo import haversine, meters_per_degree
+from .geo import haversine, meters_per_degree, offset_meters
+
+
+def smooth_stroke(points, spacing=12.0):
+    """Smooth a mouse stroke in screen pixels while preserving both endpoints."""
+    lengths = [math.dist(a, b) for a, b in zip(points, points[1:])]
+    length = sum(lengths)
+    if len(points) == 2 and length:
+        a, b = points
+        return [a, ((a[0]+b[0])/2, (a[1]+b[1])/2), b]
+    if length <= spacing or len(points) < 3:
+        return list(points)
+
+    # Uniform distances keep a slow mouse movement from getting extra weight.
+    count = math.ceil(length / spacing)
+    samples = [points[0]]
+    segment = 0
+    segment_end = lengths[0]
+    for i in range(1, count):
+        distance = length * i / count
+        while segment_end < distance:
+            segment += 1
+            segment_end += lengths[segment]
+        a, b = points[segment:segment + 2]
+        t = 1 - (segment_end - distance) / lengths[segment]
+        samples.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+    samples.append(points[-1])
+
+    controls = [samples[0]]
+    for i in range(1, len(samples) - 1):
+        radius = min(2, i, len(samples) - 1 - i)
+        weights = [radius + 1 - abs(j) for j in range(-radius, radius + 1)]
+        nearby = samples[i-radius:i+radius+1]
+        weight_sum = sum(weights)
+        controls.append(tuple(sum(w * p[axis] for p, w in zip(nearby, weights)) / weight_sum
+                              for axis in (0, 1)))
+    controls.append(samples[-1])
+
+    # Join quadratic arcs at segment midpoints so adjacent tangents agree.
+    curve = [controls[0]]
+    for i in range(1, len(controls) - 1):
+        x, y = controls[i]
+        nx, ny = controls[i + 1]
+        end = controls[-1] if i == len(controls) - 2 else ((x + nx) / 2, (y + ny) / 2)
+        sx, sy = curve[-1]
+        for t in (0.25, 0.5, 0.75, 1.0):
+            u = 1 - t
+            curve.append((u*u*sx + 2*u*t*x + t*t*end[0],
+                          u*u*sy + 2*u*t*y + t*t*end[1]))
+    return curve
+
+
+def standard_stadium(center, bearing=0.0):
+    """A 400 m stadium template, with its long axis clockwise from north."""
+    straight = 84.39
+    radius = (400 - 2 * straight) / (2 * math.pi)
+    half = straight / 2
+    angle = math.radians(bearing)
+    c, s = math.cos(angle), math.sin(angle)
+    anchors = [offset_meters(*center, n*c - e*s, n*s + e*c)
+               for n, e in ((half+radius, 0), (half, radius), (-half, radius),
+                            (-half-radius, 0), (-half, -radius), (half, -radius))]
+    return stadium_waypoints(anchors, arc_segments=32, straight_segments=1)
 
 
 def stadium_waypoints(anchors, margin_m=0.0, arc_segments=64, straight_segments=48):

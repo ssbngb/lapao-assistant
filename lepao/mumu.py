@@ -122,18 +122,6 @@ def discover_mumu():
     if info["gateway_port"] is None:
         info["gateway_port"] = DEFAULT_GATEWAY_PORT
 
-    if manager:
-        try:
-            out = subprocess.run([manager, "info", "-v", "all"], capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace", timeout=20)
-            data = json.loads(out.stdout)
-            items = data if isinstance(data, list) else ([data] if "index" in data else data.values())
-            for item in items:
-                if str(item.get("index")) == str(selected_index):
-                    info["vm_index"] = int(item.get("index", 0))
-                    break
-        except Exception:
-            pass
     return info
 
 
@@ -187,7 +175,8 @@ class MuMuGateway:
         if not self.manager_path or not os.path.exists(self.manager_path):
             raise RuntimeError("未找到 MuMuManager.exe，请确认已安装 MuMu 模拟器")
         out = subprocess.run([self.manager_path, *args], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=timeout)
+                             encoding="utf-8", errors="replace", timeout=timeout,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         text = (out.stdout or "") + (out.stderr or "")
         if out.returncode != 0:
             raise RuntimeError("MuMuManager 失败: %s" % text.strip())
@@ -332,10 +321,10 @@ class MuMuGateway:
     def _resolve_adb_serial(self):
         data = json.loads(self.manager("info", "-v", str(self.vm_index)))
         if isinstance(data, list):
-            data = next(i for i in data if str(i.get("index")) == str(self.vm_index))
+            data = next((i for i in data if str(i.get("index")) == str(self.vm_index)), {})
         elif "index" not in data:
             data = data.get(str(self.vm_index), {})
-        if not data.get("adb_port"):
+        if data.get("is_process_started") is False or not data.get("adb_port"):
             raise RuntimeError("所选模拟器尚未启动或未提供 ADB 端口，请启动该实例")
         self._adb_serial = "%s:%s" % (data.get("adb_host_ip", "127.0.0.1"), data["adb_port"])
 
