@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 
 TARGET_M = float(sys.argv[1]) if len(sys.argv) > 1 else 2050.0
 
-# 与 campus_run.py 保持一致的标准 400m 跑道几何
+# 标准 400 米跑道几何
 LANE_STRAIGHT = 84.39
 LANE_RADIUS = 36.5
 LANE_LEN = 2 * LANE_STRAIGHT + 2 * math.pi * LANE_RADIUS

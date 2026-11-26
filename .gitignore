@@ -21,7 +21,6 @@ Thumbs.db
 *.lock
 *.log
 app_error.log
-campus_run.lock
 run_now.log
 run_now.err
 
