@@ -63,6 +63,8 @@ TILE_RETRY_S = 15
 BRUSH_SAMPLE_PX = 4
 BRUSH_MIN_LENGTH_PX = 8
 MAX_ROUTE_LAPS = 200
+START_FIX_TOLERANCE_M = 2.5
+START_FIX_TIMEOUT_S = 6
 PYTHON = (os.path.join(os.path.dirname(sys.executable), "python.exe")
           if os.path.basename(sys.executable).lower() == "pythonw.exe"
           else sys.executable)
@@ -204,6 +206,18 @@ def _route_laps(value):
     if not text.isascii() or not text.isdecimal() or len(text) > 3 or not 1 <= int(text) <= MAX_ROUTE_LAPS:
         raise ValueError(f"圈数须为 1～{MAX_ROUTE_LAPS} 的整数")
     return int(text)
+
+
+def _pace_text(seconds_per_km):
+    minutes, seconds = divmod(round(seconds_per_km), 60)
+    return f"{minutes}'{seconds:02d}\""
+
+
+def _selected_speed(variable):
+    # ttk.Scale 给出连续值；让显示、配速换算与实际采用的速度共用 0.1 m/s 精度。
+    speed = round(variable.get(), 1)
+    variable.set(speed)
+    return speed
 
 
 def _route_speeds(base_speed):
@@ -365,6 +379,44 @@ class Runner:
         if not gps["enabled"] or gps["location"] is None:
             raise ValueError("尚未取得模拟器 GPS 位置，请开启定位后重试")
         return _coordinates(*gps["location"])
+
+    def sync_start(self, home, cancel, waiting_for_gps):
+        """初始化模拟器定位，回读确认后从起点重新记录轨迹。"""
+        with self.motion_lock:
+            if cancel.is_set() or self._stopped.is_set():
+                return False
+            self.trail.clear()
+            self.client.set_wgs84(*home)
+        deadline = None
+        waiting = False
+        while not cancel.is_set() and not self._stopped.is_set():
+            gps = self.client.gps_status()
+            if not gps["enabled"]:
+                raise ValueError("模拟器定位未开启，请开启后重试")
+            if gps["active"] is False:
+                if not waiting:
+                    waiting_for_gps()
+                    waiting = True
+                deadline = None
+                cancel.wait(1)
+                continue
+            if deadline is None:
+                deadline = time.monotonic() + START_FIX_TIMEOUT_S
+            fix = gps["location"]
+            gap = haversine(*home, *_coordinates(*fix)) if fix is not None else None
+            if gap is not None and gap <= START_FIX_TOLERANCE_M:
+                with self.motion_lock:
+                    if cancel.is_set() or self._stopped.is_set():
+                        return False
+                    self.trail.append(home)
+                    self.last_error = ""
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                detail = "未读到 GPS 位置" if gap is None else f"GPS 仍距起点 {gap:.1f} 米"
+                raise ValueError(f"已发送起点，{detail}，请检查模拟器定位后重试")
+            cancel.wait(min(0.4, remaining))
+        return False
 
     def _position(self):
         if not self.trail:
@@ -896,7 +948,7 @@ class JoystickTab(ttk.Frame):
         metrics.columnconfigure(tuple(range(4)), weight=1, uniform="metric")
         self.metrics = {}
         for column, (key, text) in enumerate((("distance", "里程"), ("time", "用时"),
-                                               ("pace", "配速"), ("count", "已打卡"))):
+                                               ("pace", "乐跑平均配速"), ("count", "已打卡"))):
             item = ttk.Frame(metrics, style="Surface.TFrame")
             item.grid(row=0, column=column, sticky="ew", padx=(0, 12))
             ttk.Label(item, text=text, style="Muted.TLabel").pack(anchor="w")
@@ -1029,7 +1081,7 @@ class JoystickTab(ttk.Frame):
     def _go(self, b):
         if self.navigation.running:
             return
-        if not self.navigation.manual_ready:
+        if not self.navigation.origin_ready:
             self.navigation.return_home(self.spd.get(), on_arrival=self._sync)
             return
         self.active = True
@@ -1078,11 +1130,10 @@ class JoystickTab(ttk.Frame):
             self._go(math.degrees(math.atan2(de, dn)) % 360.0)
 
     def _speed(self, _=None):
-        v = self.spd.get()
+        v = _selected_speed(self.spd)
         self.r.set_speed(v)
         self.r.feeder.set_cadence(cadence_for_speed(v*3.6))
-        p = 1000.0/v if v > 0 else 0
-        self.lb_pace.config(text=f"{v:.1f} m/s   ·   {int(p//60)}'{int(p%60):02d}\"/km")
+        self.lb_pace.config(text=f"{v:.1f} m/s   ·   {_pace_text(1000 / v)}/km")
 
     def _halt(self):
         if not self.active:
@@ -1113,7 +1164,7 @@ class JoystickTab(ttk.Frame):
             self.lb_cp.config(text="等待进入跑步页…")
             return
         p = st.avg_pace_s
-        ps = ("%d'%02d\"" % (p//60, p%60)) if p else "--"
+        ps = _pace_text(p) if p else "--"
         self.metrics["distance"].config(text=f"{st.distance_m/1000:.2f} km")
         self.metrics["time"].config(text=f"{st.elapsed_s//60:02d}:{st.elapsed_s%60:02d}")
         self.metrics["pace"].config(text=ps)
@@ -1138,7 +1189,7 @@ class RouteTab(ttk.Frame):
         self.laps = tk.StringVar(value="1")
         self.preview_timer = None
         self.status = tk.StringVar(value="")
-        self.manual_ready = False
+        self.origin_ready = False
         self.planning = False
         self.stop_manual = lambda: None
         self.running = False
@@ -1390,11 +1441,11 @@ class RouteTab(ttk.Frame):
         except (OSError, ValueError) as exc:
             messagebox.showerror("设置起点失败", str(exc))
             return False
-        self.manual_ready = False
+        self.origin_ready = False
         self.mode_v.set("brush")
         self._mode()
         self._refresh_route()
-        self.status.set(f"共同起点已保存 · {home[0]:.6f}, {home[1]:.6f}")
+        self.status.set(f"共同起点已保存 · {home[0]:.6f}, {home[1]:.6f} · 首次出发时同步定位")
         return True
 
     def _select_start(self, glat, glon):
@@ -1477,11 +1528,10 @@ class RouteTab(ttk.Frame):
         self._mode()
 
     def _speed(self, _=None):
-        v = self.spd.get()
+        v = _selected_speed(self.spd)
         self.r.set_speed(v)
         self.r.feeder.set_cadence(cadence_for_speed(v*3.6))
-        p = 1000.0/v if v > 0 else 0
-        self.lb_p.config(text=f"{v:.1f} m/s · {int(p//60)}'{int(p%60):02d}\"/km")
+        self.lb_p.config(text=f"{v:.1f} m/s · {_pace_text(1000 / v)}/km")
 
     def clear(self):
         if self.running:
@@ -1583,23 +1633,38 @@ class RouteTab(ttk.Frame):
         self.running = True
         self.planning = True
         self._sync_route_controls()
-        self._show_progress("正在规划到共同起点的路线…")
+        initialize = not self.origin_ready and (laps > 0 or on_arrival is not None)
+        self._show_progress("正在同步模拟器定位到共同起点…" if initialize else "正在规划到共同起点的路线…")
+
+        def waiting_for_gps():
+            if self.cancel is cancel and not cancel.is_set() and not self.closing:
+                self._show_progress("已发送起点，等待 GPS 更新。请在模拟器内打开显示当前位置的地图页，或点「停止」。")
 
         def plan():
             try:
-                current, trail = self.r.navigation_snapshot(cancel)
-                if cancel.is_set():
-                    return
-                approach, source = plan_return(current, home, course, trail, cancel)
+                if initialize:
+                    if not self.r.sync_start(home, cancel, lambda: self.post(waiting_for_gps)):
+                        return
+                    approach, source = None, "共同起点"
+                else:
+                    current, trail = self.r.navigation_snapshot(cancel)
+                    if cancel.is_set():
+                        return
+                    approach, source = plan_return(current, home, course, trail, cancel)
             except Exception as exc:
-                msg = f"返程规划失败 · {_explain(exc)}"
+                action = "同步起点失败" if initialize else ("前往起点失败" if laps else "返程规划失败")
+                msg = f"{action} · {str(exc) if isinstance(exc, ValueError) else _explain(exc)}"
                 self.post(lambda: self._run_finished(cancel, msg))
                 return
             def begin():
                 if cancel.is_set() or self.closing:
                     return
                 self.planning = False
-                self.manual_ready = True
+                self.origin_ready = True
+                if initialize:
+                    self.map.robot = wgs84_to_gcj02(home[1], home[0])[::-1]
+                    self.map.redraw()
+                    self._log("模拟器 GPS 已确认在共同起点")
                 if approach is None and not laps:
                     self._run_finished(cancel, "已在共同起点")
                     if on_arrival:
@@ -1648,10 +1713,18 @@ class RouteTab(ttk.Frame):
             for lap in range(1, laps + 1):
                 if cancel.is_set():
                     break
-                total += self._walk(cancel, track, base_speed, speeds, lap, laps)
+                started = time.monotonic()
+                distance = self._walk(cancel, track, base_speed, speeds, lap, laps)
+                elapsed = time.monotonic() - started
+                total += distance
                 if cancel.is_set():
                     break
-                self._log(f"已完成第 {lap}/{laps} 圈，累计 {total:.0f} m")
+                if distance < track.length:
+                    result = f"路线已停止，共 {total:.0f} m"
+                    return
+                pace = _pace_text(elapsed * 1000 / distance)
+                self._log(f"已完成第 {lap}/{laps} 圈，累计 {total:.0f} m。"
+                          f"本圈 {distance:.0f} m，用时 {elapsed:.1f} 秒，路线配速 {pace}/km")
             if laps:
                 result = f"路线结束 · {laps} 圈，共 {total:.0f} m"
         except Exception as ex:
@@ -1669,8 +1742,7 @@ class RouteTab(ttk.Frame):
         if not self.running or cancel is not self.cancel:
             return
         if cancel.is_set():
-            message = "已停止，可从当前位置继续"
-        self.manual_ready = True
+            message = "已停止，可从当前位置继续" if self.origin_ready else "已停止，尚未确认共同起点"
         self.planning = False
         self.running = False
         self._sync_route_controls()
@@ -1694,7 +1766,6 @@ class RouteTab(ttk.Frame):
     def stop(self):
         if self.running:
             self.cancel.set()
-            self.manual_ready = True
             self.r.feeder.pause()
             if self.planning:
                 self._run_finished(self.cancel, "")

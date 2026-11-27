@@ -406,15 +406,19 @@ class MuMuGateway:
         # Passive provider may retain an old GPS fix after the active GPS
         # provider has moved. Never accept that first matching cache entry.
         provider = re.search(r"(?m)^([ \t]*)gps provider:\s*\n", dump)
+        active = None
         if provider:
             rest = dump[provider.end():]
             end = re.search(r"(?m)^" + re.escape(provider[1]) + r"\S", rest)
             dump = rest[:end.start()] if end else rest
+            request = re.search(r"(?m)^\s*service:\s*ProviderRequest\[([^\]]*)\]", dump)
+            if request:
+                active = request[1].strip() != "OFF"
         elif re.search(r"(?m)^\s*\w+ provider:", dump):
             dump = ""
         fix = re.search(r"last\s*location\s*[:=]\s*Location\[gps\s+(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)[^\n]*", dump, re.I)
         sat = re.search(r"satellites=(\d+)", fix.group(0)) if fix else None
-        return {"enabled": enabled,
+        return {"enabled": enabled, "active": active,
                 "location": (float(fix[1]), float(fix[2])) if fix else None,
                 "satellites": int(sat[1]) if sat else None}
 
