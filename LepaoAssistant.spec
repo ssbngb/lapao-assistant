@@ -2,7 +2,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 analysis = Analysis(
     ["app.py"],
-    datas=[("LICENSE", ".")] + collect_data_files("rapidocr_onnxruntime"),
+    datas=[("LICENSE", "."), ("assets/logo.ico", "assets")] + collect_data_files("rapidocr_onnxruntime"),
     hiddenimports=["check_env", "check_track"],
 )
 exe = EXE(
@@ -12,6 +12,7 @@ exe = EXE(
     analysis.datas,
     [],
     name="步道乐跑助手",
+    icon="assets/logo.ico",
     console=True,
     hide_console="hide-early",
     upx=False,

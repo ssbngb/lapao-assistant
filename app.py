@@ -53,6 +53,7 @@ from lepao.navigation import plan_return
 from screen_state import ScreenReader, read_screen_state
 
 CONFIG_PATH = os.path.join(HERE, "run_config.json")
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.ico")
 ROUTE_PATH = os.path.join(HERE, "route.json")
 TILE_DIR = os.path.join(HERE, "_tiles")
 TILE_SIZE = 256
@@ -1945,6 +1946,15 @@ class App:
 
         header = ttk.Frame(root, style="Header.TFrame", padding=(16, 8))
         header.pack(fill="x")
+        logo_size = max(16, round(root.winfo_fpixels("24p")))
+        with Image.open(LOGO_PATH) as logo:
+            self.logo = ImageTk.PhotoImage(logo.resize((logo_size, logo_size), Image.Resampling.LANCZOS),
+                                           master=root)
+        if sys.platform == "win32":
+            root.iconbitmap(default=LOGO_PATH)
+        else:
+            root.iconphoto(True, self.logo)
+        ttk.Label(header, image=self.logo, style="Title.TLabel").pack(side="left", padx=(0, 8))
         ttk.Label(header, text="步道乐跑控制台", style="Title.TLabel").pack(side="left")
         self.reconnect_btn = ttk.Button(header, text="重新连接", command=self._reconnect)
         self.reconnect_btn.pack(side="right")
