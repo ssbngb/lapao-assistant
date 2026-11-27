@@ -4,6 +4,16 @@
 >
 > 基于 [wmuj/budao-lepao](https://github.com/wmuj/budao-lepao) 重构，主要解决了原版**只服务单一学校、无法自定义路线、缺少 GUI** 三个问题。
 
+## 下载 Windows 版
+
+**[直接下载 Windows 10 / 11（64 位）单文件 EXE](https://github.com/ssbngb/lapao-assistant/releases/latest/download/LepaoAssistant-Windows-x64.exe)** · [发行说明与历史版本](https://github.com/ssbngb/lapao-assistant/releases)
+
+1. 下载 `LepaoAssistant-Windows-x64.exe`。如果已打开发行页面，展开 **Assets（附件）**，点击这个文件名即可。Python 和离线文字识别模型已包含在 EXE 中。
+2. 在桌面新建一个「步道乐跑助手」文件夹，把 EXE 放进去，双击打开。设置、默认路线和地图缓存都会保存在这个文件夹里。
+3. 可以先在「路线」页绘图。要连接乐跑，再启动 MuMu 模拟器、开启 ADB 调试，在模拟器里登录步道乐跑并进入跑步计时页。回到助手，点击窗口顶部的「设置起点」。[首次跑一条路线](#首次跑一条路线)
+
+更新已有单文件版时，先关闭旧助手，再把新版 EXE 放进原来的文件夹并打开，即可继续使用原有设置和路线。
+
 ---
 
 ## 先看几张图
@@ -28,6 +38,7 @@
 
 ## 目录
 
+- [下载 Windows 版](#下载-windows-版)
 - [先看几张图](#先看几张图)
 - [前置：脱壳版步道乐跑](#前置脱壳版步道乐跑)
 - [它解决什么问题](#它解决什么问题)
@@ -83,11 +94,11 @@
 | 项 | 版本 |
 |---|---|
 | Windows | 10 / 11 |
-| Python | 3.10+（开发环境 3.12.16） |
+| Python | 仅从源码运行时需要 3.10+（开发环境 3.12.16） |
 | MuMu 模拟器 | 12，Android 12，实例 #0 |
 | 步道乐跑 | **脱壳重打包版**（官方版有加固壳，在模拟器里会 SIGSEGV） |
 
-### 安装
+### 从源码安装
 
 在包含 `app.py` 和 `控制台.bat` 的项目目录中执行以下命令。
 
@@ -98,7 +109,14 @@ python -m venv .venv
 
 界面使用 Tkinter，地图图片由 Pillow 处理，读屏使用本地 OCR。
 
-### 运行
+要自行生成单文件版，可在 Windows x64 的项目目录运行以下命令。成品位于 `dist\步道乐跑助手.exe`。
+
+```bat
+.venv\Scripts\python.exe -m pip install "pyinstaller>=6.8,<7"
+.venv\Scripts\python.exe -m PyInstaller --noconfirm LepaoAssistant.spec
+```
+
+### 从源码运行
 
 ```bat
 控制台.bat

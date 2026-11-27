@@ -33,9 +33,11 @@ if sys.platform == "win32":
             pass
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace") if sys.stdout else None
-HERE = os.path.dirname(os.path.abspath(__file__))
+FROZEN = getattr(sys, "frozen", False)
+HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 os.chdir(HERE)
-sys.path.insert(0, HERE)
+if not FROZEN:
+    sys.path.insert(0, HERE)
 
 from PIL import Image, ImageTk
 try:
@@ -942,7 +944,7 @@ class JoystickTab(ttk.Frame):
         self.keys = set()
         self.dirs = []
         self.dragging = False
-        self.drag_bearing = None
+        self.stick_offset = (0.0, 0.0)   # 相对摇杆半径，重绘时保留正在按住的方向
         self.active = False
         self._build()
         navigation.status.trace_add("write", self._sync_controls)
@@ -977,7 +979,7 @@ class JoystickTab(ttk.Frame):
         self.cv = tk.Canvas(left, width=300, height=255, bg=SURFACE,
                             highlightthickness=0, cursor="hand2")
         self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Configure>", self._resize)
+        self.cv.bind("<Configure>", self._draw)
         self.cv.bind("<Button-1>", self._press)
         self.cv.bind("<B1-Motion>", self._drag)
         self.cv.bind("<ButtonRelease-1>", self._release)
@@ -1021,6 +1023,7 @@ class JoystickTab(ttk.Frame):
         act = ttk.Frame(right); act.pack(fill="x", pady=(8, 0))
         ttk.Button(act, text="立即停下", style="Stop.TButton", command=self.stop_all).pack(side="left")
         self.reset_btn = ttk.Button(act, text="复位到起点", command=self.reset)
+        self.reset_btn.bind("<KeyPress-space>", self._stop_from_reset)
         self.reset_btn.pack(side="left", padx=(6, 0))
         ttk.Label(right, textvariable=self.navigation.status, wraplength=300).pack(anchor="w", pady=4)
 
@@ -1036,16 +1039,11 @@ class JoystickTab(ttk.Frame):
         cy = self.cv.winfo_height() / 2
         return cx, cy, max(1, min(120, cx - 28, cy - 28))
 
-    def _resize(self, _e):
-        if self.dragging:
-            self.stop()
-        else:
-            self._draw(0, 0)
-
-    def _draw(self, dx, dy):
+    def _draw(self, _event=None):
         c = self.cv
         cx, cy, R = self._joystick_geometry()
-        knob_x, knob_y = cx + dx, cy + dy
+        dx, dy = self.stick_offset
+        knob_x, knob_y = cx + dx * R, cy + dy * R
         c.delete("all")
         c.create_oval(cx-R, cy-R, cx+R, cy+R, outline=BORDER, width=2, fill="#f3f8f7")
         for ring in (R * 0.6, R * 0.32):
@@ -1064,6 +1062,7 @@ class JoystickTab(ttk.Frame):
     def _press(self, e):
         if self.navigation.running:
             return
+        self.cv.focus_set()
         self.dragging = True
         self._fromxy(e.x, e.y)
 
@@ -1073,24 +1072,21 @@ class JoystickTab(ttk.Frame):
 
     def _release(self, e):
         self.dragging = False
-        self.drag_bearing = None
+        self.stick_offset = (0.0, 0.0)
         self._sync()
-        self._draw(0, 0)
+        self._draw()
 
     def _fromxy(self, x, y):
         cx, cy, radius = self._joystick_geometry()
         dx, dy = x-cx, y-cy
         r = math.hypot(dx, dy)
         if r < 12:
-            self.drag_bearing = None
-            self._sync()
-            self._draw(0, 0)
-            return
-        if r > radius:
-            dx, dy = dx*radius/r, dy*radius/r
-        self.drag_bearing = math.degrees(math.atan2(dx, -dy)) % 360.0
+            self.stick_offset = (0.0, 0.0)
+        else:
+            scale = max(radius, r)
+            self.stick_offset = (dx / scale, dy / scale)
         self._sync()
-        self._draw(dx, dy)
+        self._draw()
 
     def _go(self, b):
         if self.navigation.running:
@@ -1132,8 +1128,9 @@ class JoystickTab(ttk.Frame):
         if self.dirs:
             self._go(self.dirs[-1])
             return
-        if self.drag_bearing is not None:
-            self._go(self.drag_bearing)
+        dx, dy = self.stick_offset
+        if dx or dy:
+            self._go(math.degrees(math.atan2(dx, -dy)) % 360.0)
             return
         dn = de = 0.0
         for k in self.keys:
@@ -1170,9 +1167,9 @@ class JoystickTab(ttk.Frame):
         self.dirs.clear()
         self.keys.clear()
         self.dragging = False
-        self.drag_bearing = None
+        self.stick_offset = (0.0, 0.0)
         self._halt()
-        self._draw(0, 0)
+        self._draw()
 
     def reset(self):
         self.navigation.return_home(self.spd.get())
@@ -1180,6 +1177,10 @@ class JoystickTab(ttk.Frame):
     def stop_all(self):
         self.stop()
         self.navigation.stop()
+
+    def _stop_from_reset(self, _event):
+        self.stop_all()
+        return "break"
 
     def update_state(self, st):
         if st is None:
@@ -1350,6 +1351,7 @@ class RouteTab(ttk.Frame):
             if text in ("加载路线", "清空路线"):
                 self.edit_controls.append(button)
         self.home_btn = ttk.Button(act, text="回到起点", command=lambda: self.return_home(self.spd.get()))
+        self.home_btn.bind("<KeyPress-space>", self._stop_from_home)
         self.home_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self._sync_route_controls()
         self.laps.trace_add("write", self._laps_changed)
@@ -1797,6 +1799,10 @@ class RouteTab(ttk.Frame):
             else:
                 self._sync_route_controls()
 
+    def _stop_from_home(self, _event):
+        self.stop()
+        return "break"
+
     def _log(self, m):
         self.post(lambda: self.log.append(time.strftime("[%H:%M:%S] ") + m + "\n"))
 
@@ -1857,7 +1863,8 @@ class ToolsTab(ttk.Frame):
         if self.closing or self.proc:
             return
         try:
-            proc = subprocess.Popen([PYTHON, "-u", *args], cwd=HERE,
+            command = [sys.executable, "--tool"] if FROZEN else [PYTHON, "-u"]
+            proc = subprocess.Popen([*command, *args], cwd=HERE,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace",
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -2178,4 +2185,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--tool"]:
+        import runpy
+        tools = {"check_env.py": "check_env", "check_track.py": "check_track"}
+        if len(sys.argv) < 3 or sys.argv[2] not in tools:
+            sys.exit("未知工具")
+        sys.argv = sys.argv[2:]
+        runpy.run_module(tools[sys.argv[0]], run_name="__main__")
+    else:
+        main()
