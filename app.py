@@ -63,6 +63,8 @@ TILE_RETRY_S = 15
 BRUSH_SAMPLE_PX = 4
 BRUSH_MIN_LENGTH_PX = 8
 MAX_ROUTE_LAPS = 200
+SPEED_HOLD_S = 30
+VARY_SPEED_LABEL = f"随机变速（约每 {SPEED_HOLD_S} 秒，±10%）"
 START_FIX_TOLERANCE_M = 2.5
 START_FIX_TIMEOUT_S = 6
 PYTHON = (os.path.join(os.path.dirname(sys.executable), "python.exe")
@@ -220,17 +222,15 @@ def _selected_speed(variable):
     return speed
 
 
-def _route_speeds(base_speed):
-    """在相邻的随机目标速度之间逐步过渡，每次定位更新取一个速度。"""
+def _random_speeds(base_speed):
+    """每档速度保持约 30 秒，到期后在下一个定位点切换。"""
     low = max(1.0, base_speed * 0.9)
     high = min(6.0, base_speed * 1.1)
-    speed = base_speed
     while True:
-        target = random.uniform(low, high)
-        steps = random.randint(8, 16)
-        for i in range(1, steps + 1):
-            yield speed + (target - speed) * i / steps
-        speed = target
+        speed = random.uniform(low, high)
+        change_at = time.monotonic() + SPEED_HOLD_S
+        while time.monotonic() < change_at:
+            yield speed
 
 
 def _route_distances(track):
@@ -321,6 +321,8 @@ class Runner:
         self.motion_lock = threading.Lock()
         self.bearing = None          # None = 停止
         self.speed = 2.8
+        self._manual_speeds = None
+        self.manual_speed = None     # 最近一次手动移动使用的速度
         self.push_interval = self.cfg["push_interval"]
         self.lock = threading.Lock()
         self._stopped = threading.Event()
@@ -426,10 +428,16 @@ class Runner:
     def halt(self):
         with self.lock:
             self.bearing = None
+            self._manual_speeds = None
+            self.manual_speed = None
 
-    def set_speed(self, v):
+    def set_speed(self, v, vary_speed=False):
+        base = max(1.0 if vary_speed else 0.5, min(6.0, v))
         with self.lock:
-            self.speed = max(0.5, min(6.0, v))
+            if base == self.speed and vary_speed == (self._manual_speeds is not None):
+                return
+            self.speed = base
+            self._manual_speeds = _random_speeds(base) if vary_speed else None
 
     def _push(self, lat, lon):
         """调用方持有 motion_lock。只记录网关确认的位移。"""
@@ -458,15 +466,10 @@ class Runner:
         while not self._stopped.is_set():
             with self.lock:
                 b = self.bearing
-                v = self.speed
                 iv = self.push_interval
             if b is None:
                 self._stopped.wait(0.06)
                 continue
-            step = v * iv
-            bb = (b + (time.time() % 7 - 3.5) * 0.6) % 360.0
-            dn = math.cos(math.radians(bb)) * step
-            de = math.sin(math.radians(bb)) * step
             try:
                 with self.motion_lock:
                     with self.lock:
@@ -476,6 +479,12 @@ class Runner:
                     with self.lock:
                         if self.bearing != b or self._stopped.is_set():
                             continue
+                        v = next(self._manual_speeds) if self._manual_speeds is not None else self.speed
+                        self.manual_speed = v
+                    step = v * iv
+                    bb = (b + (time.time() % 7 - 3.5) * 0.6) % 360.0
+                    dn = math.cos(math.radians(bb)) * step
+                    de = math.sin(math.radians(bb)) * step
                     self._push(*offset_meters(*current, dn, de))
             except Exception as exc:
                 self.last_error = _explain(exc)
@@ -991,7 +1000,7 @@ class JoystickTab(ttk.Frame):
             btn.bind("<ButtonPress-1>", lambda e, bb=b: self._press_dir(bb))
             btn.bind("<ButtonRelease-1>", lambda e, bb=b: self._release_dir(bb))
 
-        sp = _card(right, "速度", padding=10)
+        sp = _card(right, "基准速度", padding=10)
         sp.pack(fill="x", pady=(10, 0))
         self.spd = tk.DoubleVar(value=2.8)
         row = ttk.Frame(sp, style="Surface.TFrame")
@@ -1001,8 +1010,13 @@ class JoystickTab(ttk.Frame):
                                      command=self._speed)
         self.speed_scale.pack(side="left", fill="x", expand=True, padx=4)
         ttk.Label(row, text="6.0", style="Muted.TLabel").pack(side="left")
-        self.lb_pace = ttk.Label(sp, text="2.8 m/s   ·   5'57\"/km", style="Accent.TLabel")
+        self.vary_speed = tk.BooleanVar(value=True)
+        self.speed_toggle = ttk.Checkbutton(sp, text=VARY_SPEED_LABEL, variable=self.vary_speed,
+                                            command=self._speed)
+        self.speed_toggle.pack(anchor="w", pady=(4, 0))
+        self.lb_pace = ttk.Label(sp, style="Accent.TLabel")
         self.lb_pace.pack(anchor="w", pady=(3, 0))
+        self.show_speed()
 
         act = ttk.Frame(right); act.pack(fill="x", pady=(8, 0))
         ttk.Button(act, text="立即停下", style="Stop.TButton", command=self.stop_all).pack(side="left")
@@ -1012,7 +1026,7 @@ class JoystickTab(ttk.Frame):
 
     def _sync_controls(self, *_):
         busy = self.navigation.running
-        for control in [self.speed_scale, *self.direction_buttons]:
+        for control in [self.speed_scale, self.speed_toggle, *self.direction_buttons]:
             control.state(["disabled"] if busy else ["!disabled"])
         self.reset_btn.state(["disabled"] if busy or self.r.home is None else ["!disabled"])
         self.cv.configure(cursor="arrow" if busy else "hand2")
@@ -1085,7 +1099,7 @@ class JoystickTab(ttk.Frame):
             self.navigation.return_home(self.spd.get(), on_arrival=self._sync)
             return
         self.active = True
-        self.r.set_speed(self.spd.get())
+        self.r.set_speed(self.spd.get(), self.vary_speed.get())
         self.r.go(b)
         self.r.feeder.resume()
 
@@ -1131,9 +1145,18 @@ class JoystickTab(ttk.Frame):
 
     def _speed(self, _=None):
         v = _selected_speed(self.spd)
-        self.r.set_speed(v)
+        self.r.set_speed(v, self.vary_speed.get())
         self.r.feeder.set_cadence(cadence_for_speed(v*3.6))
-        self.lb_pace.config(text=f"{v:.1f} m/s   ·   {_pace_text(1000 / v)}/km")
+        self.show_speed()
+
+    def show_speed(self):
+        base = self.spd.get()
+        speed = self.r.manual_speed
+        if speed is not None and self.vary_speed.get():
+            text = f"基准 {base:.1f} · 当前 {speed:.2f} m/s · {_pace_text(1000 / speed)}/km"
+        else:
+            text = f"基准 {base:.1f} m/s · {_pace_text(1000 / base)}/km"
+        self.lb_pace.config(text=text)
 
     def _halt(self):
         if not self.active:
@@ -1141,6 +1164,7 @@ class JoystickTab(ttk.Frame):
         self.active = False
         self.r.halt()
         self.r.feeder.pause()
+        self.show_speed()
 
     def stop(self):
         self.dirs.clear()
@@ -1306,7 +1330,8 @@ class RouteTab(ttk.Frame):
         ttk.Label(row, text="6.0", style="Muted.TLabel").pack(side="left")
 
         self.vary_speed = tk.BooleanVar(value=True)
-        self.speed_toggle = ttk.Checkbutton(sp, text="随机变速（±10%）", variable=self.vary_speed)
+        self.speed_toggle = ttk.Checkbutton(sp, text=VARY_SPEED_LABEL,
+                                            variable=self.vary_speed)
         self.speed_toggle.pack(anchor="w", pady=(4, 0))
 
         act = _card(right, padding=10)
@@ -1708,7 +1733,7 @@ class RouteTab(ttk.Frame):
             if laps and not cancel.is_set():
                 mode = "随机变速" if vary_speed else "匀速"
                 self._log(f"沿路线跑：{laps} 圈，单圈 {track.length:.0f} m，{mode}，基准 {base_speed:.1f} m/s")
-            speeds = _route_speeds(base_speed) if vary_speed else None
+            speeds = _random_speeds(base_speed) if vary_speed else None
             total = 0.0
             for lap in range(1, laps + 1):
                 if cancel.is_set():
@@ -2014,6 +2039,8 @@ class App:
         if self._closing:
             return
         self._show_connection()
+        if self.t_joy.active:
+            self.t_joy.show_speed()
         in_window = 6 <= time.localtime().tm_hour < 23
         self.clock.config(text=time.strftime("%H:%M:%S") + ("  有效时段内" if in_window else "  已超时段"),
                           foreground=MUTED if in_window else DANGER)
